@@ -73,7 +73,7 @@ namespace gpu
 
     // Fixed-function blending of the colour output: result = output * src (op) target * dst, colour channels only;
     // alpha is written as the shader gives it. Src1Alpha is the second (dual-source) output's alpha.
-    enum class BlendFactor : uint8_t { Zero, One, Src1Alpha, OneMinusSrc1Alpha };
+    enum class BlendFactor : uint8_t { Zero, One, Src1Alpha, OneMinusSrc1Alpha, DstAlpha };
     enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract };
     struct BlendDesc
     {
@@ -81,6 +81,7 @@ namespace gpu
         BlendOp op = BlendOp::Add;
         BlendFactor src = BlendFactor::One, dst = BlendFactor::Zero;
         uint8_t writeMask = 0xF; // bit 0 red .. bit 3 alpha
+        uint8_t passes = 1;      // the renderer draws this many times (not part of the GPU state)
     };
 
     struct PipelineDesc

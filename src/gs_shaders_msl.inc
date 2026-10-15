@@ -395,13 +395,18 @@ static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, text
         float f = 1.0, ks = 1.0;
         if (S(abe) != 0)
         {
-            const float C = S(blendC) == 0 ? c.a : float(u.fix);
+            // C from the target's alpha is applied by the blend unit (DestinationAlpha): f = 1 here.
+            const float C = S(blendC) == 0 ? c.a : S(blendC) == 1 ? 128.0 : float(u.fix);
             f = C / 128.0;
             ks = (S(blendA) == 0 ? f : 0.0) - (S(blendB) == 0 ? f : 0.0) + (S(blendD) == 0 ? 1.0 : 0.0);
         }
         const float alphaOut = S(fba) != 0 && c.a < 128.0 ? c.a + 128.0 : c.a;
         factorOut = f;
-        return float4(clamp(c.rgb * abs(ks), 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
+        // The GS truncates (A - B) * C / 128 where the blend unit rounds the sum to nearest: when both terms add,
+        // 0.49 less makes the rounding land where the truncation does.
+        const float kd = (S(blendA) == 1 ? f : 0.0) - (S(blendB) == 1 ? f : 0.0) + (S(blendD) == 1 ? 1.0 : 0.0);
+        const float bias = S(abe) != 0 && ks >= 0.0 && kd >= 0.0 && f != 1.0 && f != 0.0 ? 0.49 : 0.0;
+        return float4(clamp(c.rgb * abs(ks) - bias, 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
     }
     float4 d = round(destination * 255.0);
     if (S(writeMode) == 1) return destination;

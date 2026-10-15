@@ -927,7 +927,6 @@ namespace
         // background the first time the combination is drawn, the generic pipeline standing in until it is ready.
         bool specializedAvailable = false;
         bool fixedBlend = false; // device->prefersFixedBlend(): see hwBlend()
-        uint64_t fixedBlendDraws = 0;
         struct Specialized { gpu::PipelineRef state; bool requested = false; };
         std::unordered_map<uint64_t, Specialized> specialized;
         std::mutex specializedMutex;
@@ -937,38 +936,77 @@ namespace
         // C/128 (second output) and the blend unit applies kd. Left to the destination-reading shader: C from the
         // target's alpha, kd = 1 + C, both terms negative, wrapping colours (COLCLAMP off), write masks other than "no
         // alpha", and reads of the target itself. Rounding differs from the GS by at most a step (it truncates (A-B)*C).
+    public:
+        // Why draws still read the target (PS2X_GS_NATIVE_BLEND_STATS=1 prints these at exit).
+        mutable std::map<std::string, uint64_t> blendMisses;
+        uint64_t fixedBlendDraws = 0;
+    private:
         bool hwBlend(const Uniforms &u, gpu::BlendDesc &out) const
         {
-            if (u.texSelf != 0u || (u.fbmask != 0u && u.fbmask != 0xFF000000u))
+            static const bool stats = std::getenv("PS2X_GS_NATIVE_BLEND_STATS") != nullptr;
+            const auto miss = [&](const char *why) {
+                if (stats)
+                {
+                    char key[96];
+                    std::snprintf(key, sizeof key, "%s A%u B%u C%u D%u mask%08x wm%u clamp%u", why, u.blendA, u.blendB, u.blendC, u.blendD, u.fbmask, u.writeMode, u.colclamp);
+                    ++blendMisses[key];
+                }
                 return false;
+            };
+            if (u.texSelf != 0u)
+                return miss("self");
+            // Write masks that cover whole channels are the blend unit's write mask.
+            uint8_t channels = 0xF;
+            for (uint32_t byte = 0; byte < 4u; ++byte)
+            {
+                const uint32_t m = (u.fbmask >> (byte * 8u)) & 0xFFu;
+                if (m == 0xFFu)
+                    channels &= uint8_t(~(1u << byte));
+                else if (m != 0u)
+                    return miss("fbmask");
+            }
             out = gpu::BlendDesc{};
-            out.writeMask = u.writeMode == 1u ? 0u : (u.writeMode == 2u || u.fbmask == 0xFF000000u) ? 0x7u : 0xFu;
+            out.writeMask = u.writeMode == 1u ? 0u : u.writeMode == 2u ? uint8_t(channels & 0x7u) : channels;
             if (u.abe == 0u)
                 return true;
-            if (u.blendC == 1u || u.colclamp == 0u)
-                return false;
+            // C from the target's alpha: Cs * Ad + Cd, the one form the game uses, is the blend unit's
+            // Cs * DST_ALPHA + Cd applied twice (the target keeps 0..255 where the GS divides by 128). A target without
+            // alpha reads as 128 there: then C is a plain 1.
+            const bool fromTargetAlpha = u.blendC == 1u && u.destinationHasAlpha != 0u;
+            if (fromTargetAlpha && !(u.blendA == 0u && u.blendB == 2u && u.blendD == 1u))
+                return miss("C=Ad");
+            if (u.colclamp == 0u)
+                return miss("wrap");
             const int fd = (u.blendA == 1u) - (u.blendB == 1u), od = u.blendD == 1u; // kd = fd * C + od
             const int fs = (u.blendA == 0u) - (u.blendB == 0u), os = u.blendD == 0u; // ks = fs * C + os
             if (fd == 1 && od == 1)
-                return false; // Cd * (1 + C)
+                return miss("Cd(1+C)");
             const bool kdNegative = fd == -1 && od == 0, ksNegative = fs == -1 && os == 0;
             if (kdNegative && ksNegative)
-                return false;
+                return miss("both-negative");
             out.enabled = true;
             out.src = gpu::BlendFactor::One;
             out.dst = fd == 0 ? (od ? gpu::BlendFactor::One : gpu::BlendFactor::Zero) : fd == -1 && od ? gpu::BlendFactor::OneMinusSrc1Alpha : gpu::BlendFactor::Src1Alpha;
             out.op = kdNegative ? gpu::BlendOp::Subtract : ksNegative ? gpu::BlendOp::ReverseSubtract : gpu::BlendOp::Add;
+            if (fromTargetAlpha)
+            {
+                out.src = gpu::BlendFactor::DstAlpha;
+                out.dst = gpu::BlendFactor::One;
+                out.op = gpu::BlendOp::Add;
+                out.passes = 2;
+            }
             return true;
         }
-        gpu::PipelineRef fixedBlendPipeline(const Uniforms &u)
+        gpu::PipelineRef fixedBlendPipeline(const Uniforms &u, uint32_t &passes)
         {
             gpu::BlendDesc blend;
             if (!hwBlend(u, blend))
                 return nullptr;
+            passes = blend.passes;
             const gpu::Specialization values = {u.tme, u.tfx, u.tcc, u.fge, u.abe, u.blendA, u.blendB, u.blendC, u.blendD, u.atst, u.alphaMode, u.writeMode, u.fba, u.colclamp,
                                                 u.destinationHasAlpha, u.texAlphaFixed, u.texIndexed, u.texLinear, u.wrapU, u.wrapV, u.texBox, u.texSelf,
                                                 u.maxLevel != 0u ? 1u : 0u, u.lodFixed != 0u ? 1u : 0u, 0u};
-            uint64_t key = 0x5EED0000u | (uint64_t(blend.enabled) << 1) | (uint64_t(blend.op) << 2) | (uint64_t(blend.src) << 4) | (uint64_t(blend.dst) << 6) | (uint64_t(blend.writeMask) << 8);
+            uint64_t key = 0x5EED0000u | (uint64_t(blend.enabled) << 1) | (uint64_t(blend.op) << 2) | (uint64_t(blend.src) << 4) | (uint64_t(blend.dst) << 7) | (uint64_t(blend.writeMask) << 10);
             if (specializedAvailable)
                 for (uint32_t value : values)
                     key = key * 11u + std::min(value, 10u);
@@ -2630,7 +2668,10 @@ namespace
                 u.alphaMode = alphaMode;
                 u.writeMode = writeMode;
                 const bool opaque = opaquePipeline && !noOpaque && u.abe == 0u && u.fbmask == 0u && writeMode == 0u && u.texSelf == 0u;
-                gpu::PipelineRef wanted = !opaque && fixedBlend ? fixedBlendPipeline(u) : nullptr;
+                uint32_t passes = 1;
+                gpu::PipelineRef wanted = !opaque && fixedBlend ? fixedBlendPipeline(u, passes) : nullptr;
+                if (!wanted)
+                    passes = 1;
                 if (wanted)
                     ++fixedBlendDraws;
                 else
@@ -2651,7 +2692,8 @@ namespace
                 encoder->setVertexBytes(&u, sizeof(u));
                 encoder->setFragmentBytes(&u, sizeof(u));
                 const uint32_t type = batch.mode & 7u;
-                encoder->draw(type == 0u ? gpu::Primitive::Point : type <= 2u ? gpu::Primitive::Line : gpu::Primitive::Triangle, batch.firstVertex, batch.vertexCount);
+                for (uint32_t pass = 0; pass < passes; ++pass)
+                    encoder->draw(type == 0u ? gpu::Primitive::Point : type <= 2u ? gpu::Primitive::Line : gpu::Primitive::Triangle, batch.firstVertex, batch.vertexCount);
                 ++drawCalls;
             };
             // What a failed alpha test still writes: 1 the frame buffer, 2 the depth buffer, 3 colour without alpha.
@@ -2765,6 +2807,16 @@ namespace
         GS_AUTORELEASE
         {
             renderer(handle).flush(true);
+            {
+                std::vector<std::pair<uint64_t, std::string>> misses;
+                for (const auto &[why, count] : renderer(handle).blendMisses)
+                    misses.emplace_back(count, why);
+                std::sort(misses.rbegin(), misses.rend());
+                if (!misses.empty())
+                    std::fprintf(stderr, "[native-gs] fixed blend: %llu draws; still reading the target:\n", (unsigned long long)renderer(handle).fixedBlendDraws);
+                for (const auto &[count, why] : misses)
+                    std::fprintf(stderr, "  %8llu  %s\n", (unsigned long long)count, why.c_str());
+            }
             std::lock_guard<std::mutex> lock(g_passTimeMutex);
             const uint64_t scanouts = std::max<uint64_t>(renderer(handle).scanoutCount(), 1u);
             for (const auto &[key, entry] : g_passTime)

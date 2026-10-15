@@ -402,12 +402,18 @@ bool shade(vec4 destination, out vec4 result)
         float f = 1.0, ks = 1.0;
         if (S(abe) != 0u)
         {
-            const float C = S(blendC) == 0u ? c.a : float(u.fix);
+            // C from the target's alpha is applied by the blend unit (DST_ALPHA): f = 1 here.
+            const float C = S(blendC) == 0u ? c.a : S(blendC) == 1u ? 128.0 : float(u.fix);
             f = C / 128.0;
             ks = (S(blendA) == 0u ? f : 0.0) - (S(blendB) == 0u ? f : 0.0) + (S(blendD) == 0u ? 1.0 : 0.0);
         }
         const float alphaOut = S(fba) != 0u && c.a < 128.0 ? c.a + 128.0 : c.a;
-        result = vec4(clamp(c.rgb * abs(ks), 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
+        // The GS truncates (A - B) * C / 128 where the blend unit rounds the sum to nearest: when both terms add,
+        // 0.49 less makes the rounding land where the truncation does.
+        // (Both coefficients as values: a test built from the specialization constants alone trips SPIRV-Cross.)
+        const float kd = (S(blendA) == 1u ? f : 0.0) - (S(blendB) == 1u ? f : 0.0) + (S(blendD) == 1u ? 1.0 : 0.0);
+        const float bias = S(abe) != 0u && ks >= 0.0 && kd >= 0.0 && f != 1.0 && f != 0.0 ? 0.49 : 0.0;
+        result = vec4(clamp(c.rgb * abs(ks) - bias, 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
         hwFactor = f;
         return true;
     }

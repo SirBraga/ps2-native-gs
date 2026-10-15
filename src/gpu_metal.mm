@@ -335,7 +335,7 @@ namespace gpu
                 descriptor.colorAttachments[0].pixelFormat = toMetal(desc.color);
                 if (desc.color != Format::Invalid)
                 {
-                    const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? MTLBlendFactorZero : f == BlendFactor::One ? MTLBlendFactorOne : f == BlendFactor::Src1Alpha ? MTLBlendFactorSource1Alpha : MTLBlendFactorOneMinusSource1Alpha; };
+                    const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? MTLBlendFactorZero : f == BlendFactor::One ? MTLBlendFactorOne : f == BlendFactor::Src1Alpha ? MTLBlendFactorSource1Alpha : f == BlendFactor::DstAlpha ? MTLBlendFactorDestinationAlpha : MTLBlendFactorOneMinusSource1Alpha; };
                     MTLRenderPipelineColorAttachmentDescriptor *c = descriptor.colorAttachments[0];
                     c.writeMask = ((desc.blend.writeMask & 1) ? MTLColorWriteMaskRed : 0) | ((desc.blend.writeMask & 2) ? MTLColorWriteMaskGreen : 0) |
                                   ((desc.blend.writeMask & 4) ? MTLColorWriteMaskBlue : 0) | ((desc.blend.writeMask & 8) ? MTLColorWriteMaskAlpha : 0);

@@ -310,6 +310,9 @@ namespace gpu
             return true;
         }
 
+        // The primitives of the current run, found through 16-pixel cells. Small shapes (mesh triangles) are kept per
+        // cell and tested exactly; large ones (full-screen effects, a flashlight cone) only mark their cells: anything
+        // else in those cells counts as overlapping, which costs a barrier at most and keeps the bookkeeping cheap.
         class OverlapRun
         {
         public:
@@ -319,56 +322,69 @@ namespace gpu
                 if (++generation == 0u)
                 {
                     for (auto &c : cells)
-                        c.generation = 0u;
+                        c.generation = c.big = 0u;
                     generation = 1u;
                 }
             }
             bool overlaps(const Shape &s)
             {
-                bool found = false;
-                visit(s, [&](Cell &c) {
-                    if (found || c.generation != generation)
-                        return;
+                const bool large = cellCount(s) > kLarge;
+                return !visit(s, [&](Cell &c) {
+                    if (c.generation != generation)
+                        return true;
+                    if (c.big == generation || large)
+                        return c.shapes.empty() && c.big != generation;
                     for (uint32_t index : c.shapes)
                         if (shapesOverlap(shapes[index], s))
-                        {
-                            found = true;
-                            return;
-                        }
+                            return false;
+                    return true;
                 });
-                return found;
             }
             void add(const Shape &s)
             {
+                const bool large = cellCount(s) > kLarge;
                 const uint32_t index = uint32_t(shapes.size());
-                shapes.push_back(s);
+                if (!large)
+                    shapes.push_back(s);
                 visit(s, [&](Cell &c) {
                     if (c.generation != generation)
                     {
                         c.generation = generation;
                         c.shapes.clear();
                     }
-                    c.shapes.push_back(index);
+                    if (large)
+                        c.big = generation;
+                    else
+                        c.shapes.push_back(index);
+                    return true;
                 });
             }
 
         private:
             static constexpr uint32_t kCells = 128; // 16-pixel cells over 2048x2048
+            static constexpr uint32_t kLarge = ~0u; // cells (any limit made more barriers than it saved: exact tests for all)
             struct Cell
             {
-                uint32_t generation = 0;
+                uint32_t generation = 0, big = 0;
                 std::vector<uint32_t> shapes;
             };
             std::vector<Cell> cells = std::vector<Cell>(kCells * kCells);
             std::vector<Shape> shapes;
             uint32_t generation = 0;
-            template <typename F> void visit(const Shape &s, F &&f)
+            static uint32_t cellOf(float c) { return uint32_t(std::clamp(int(std::floor(c / 16.0f)), 0, int(kCells) - 1)); }
+            static uint32_t cellCount(const Shape &s)
             {
-                const auto cell = [](float c) { return uint32_t(std::clamp(int(std::floor(c / 16.0f)), 0, int(kCells) - 1)); };
-                const uint32_t cx0 = cell(s.x0() - 1.0f), cx1 = cell(s.x1() + 1.0f), cy0 = cell(s.y0() - 1.0f), cy1 = cell(s.y1() + 1.0f);
+                return (cellOf(s.x1() + 1.0f) - cellOf(s.x0() - 1.0f) + 1u) * (cellOf(s.y1() + 1.0f) - cellOf(s.y0() - 1.0f) + 1u);
+            }
+            // Calls f on each cell of s while it returns true; false when f stopped early.
+            template <typename F> bool visit(const Shape &s, F &&f)
+            {
+                const uint32_t cx0 = cellOf(s.x0() - 1.0f), cx1 = cellOf(s.x1() + 1.0f), cy0 = cellOf(s.y0() - 1.0f), cy1 = cellOf(s.y1() + 1.0f);
                 for (uint32_t y = cy0; y <= cy1; ++y)
                     for (uint32_t x = cx0; x <= cx1; ++x)
-                        f(cells[y * kCells + x]);
+                        if (!f(cells[y * kCells + x]))
+                            return false;
+                return true;
             }
         };
 
@@ -394,7 +410,6 @@ namespace gpu
             SamplerRef sampler;
             bool setDirty = true, offsetDirty = true;
             VkDescriptorSet set = VK_NULL_HANDLE;
-            OverlapRun run; // for draws that read the target without rasterization order
 
             void setPipeline(const PipelineRef &p) override;
             void setDepthState(const DepthStateRef &s) override
@@ -476,6 +491,7 @@ namespace gpu
         {
             VkFence fence = VK_NULL_HANDLE;
             VkCommandPool pool = VK_NULL_HANDLE;
+            VkCommandBuffer commandBuffer = VK_NULL_HANDLE; // freed back into pool before the pool is reused
             std::vector<VkDescriptorPool> descriptorPools;
             std::vector<VkFramebuffer> framebuffers;
             std::vector<std::shared_ptr<void>> keep;
@@ -585,6 +601,15 @@ namespace gpu
             VkCommandPool uploadPool = VK_NULL_HANDLE;
             VkCommandBuffer uploadCb = VK_NULL_HANDLE;
             std::unique_ptr<Retired> uploadRetired;
+
+            // Per-command-buffer objects handed back when the GPU is done with them, reset and reused (creating them
+            // for every command buffer allocated GPU memory each time).
+            std::mutex recycleMutex;
+            std::vector<VkDescriptorPool> freeDescriptorPools;
+            std::vector<VkCommandPool> freeCommandPools;
+            std::vector<BufferRef> freeUniformChunks;
+            VkDescriptorPool takeDescriptorPool();
+            VkCommandPool takeCommandPool();
 
             // Retirement thread.
             std::mutex retireMutex;
@@ -984,10 +1009,7 @@ namespace gpu
         {
             if (uploadCb)
                 return;
-            VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-            poolInfo.queueFamilyIndex = queueFamily;
-            vkCreateCommandPool(device, &poolInfo, nullptr, &uploadPool);
+            uploadPool = takeCommandPool();
             VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             allocateInfo.commandPool = uploadPool;
             allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -997,6 +1019,7 @@ namespace gpu
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(uploadCb, &begin);
             uploadRetired = std::make_unique<Retired>();
+            uploadRetired->commandBuffer = uploadCb;
             uploadRetired->pool = uploadPool;
             // Earlier work (in submission order) is done with what these copies overwrite.
             VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1323,7 +1346,7 @@ namespace gpu
                                    ((desc.blend.writeMask & 4) ? VK_COLOR_COMPONENT_B_BIT : 0) | ((desc.blend.writeMask & 8) ? VK_COLOR_COMPONENT_A_BIT : 0);
             if (desc.blend.enabled)
             {
-                const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? VK_BLEND_FACTOR_ZERO : f == BlendFactor::One ? VK_BLEND_FACTOR_ONE : f == BlendFactor::Src1Alpha ? VK_BLEND_FACTOR_SRC1_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA; };
+                const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? VK_BLEND_FACTOR_ZERO : f == BlendFactor::One ? VK_BLEND_FACTOR_ONE : f == BlendFactor::Src1Alpha ? VK_BLEND_FACTOR_SRC1_ALPHA : f == BlendFactor::DstAlpha ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA; };
                 blend.blendEnable = VK_TRUE;
                 blend.colorBlendOp = desc.blend.op == BlendOp::Add ? VK_BLEND_OP_ADD : desc.blend.op == BlendOp::Subtract ? VK_BLEND_OP_SUBTRACT : VK_BLEND_OP_REVERSE_SUBTRACT;
                 blend.srcColorBlendFactor = factor(desc.blend.src);
@@ -1370,15 +1393,13 @@ namespace gpu
         {
             auto out = std::make_shared<VulkanCommandBuffer>();
             out->owner = this;
-            VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-            poolInfo.queueFamilyIndex = queueFamily;
-            vkCreateCommandPool(device, &poolInfo, nullptr, &out->retired->pool);
+            out->retired->pool = takeCommandPool();
             VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             allocateInfo.commandPool = out->retired->pool;
             allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             allocateInfo.commandBufferCount = 1;
             vkAllocateCommandBuffers(device, &allocateInfo, &out->cb);
+            out->retired->commandBuffer = out->cb;
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(out->cb, &begin);
@@ -1416,7 +1437,16 @@ namespace gpu
             if (retired->uniforms.empty() || retired->uniforms.back().used + aligned > kChunk)
             {
                 UniformChunk chunk;
-                chunk.buffer = owner->makeBuffer(kChunk, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+                {
+                    std::lock_guard<std::mutex> lock(owner->recycleMutex);
+                    if (!owner->freeUniformChunks.empty())
+                    {
+                        chunk.buffer = std::move(owner->freeUniformChunks.back());
+                        owner->freeUniformChunks.pop_back();
+                    }
+                }
+                if (!chunk.buffer)
+                    chunk.buffer = owner->makeBuffer(kChunk, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
                 if (!chunk.buffer)
                     return false;
                 retired->uniforms.push_back(std::move(chunk));
@@ -1427,6 +1457,48 @@ namespace gpu
             offset = uint32_t(chunk.used);
             chunk.used += aligned;
             return true;
+        }
+
+        VkDescriptorPool VulkanDevice::takeDescriptorPool()
+        {
+            {
+                std::lock_guard<std::mutex> lock(recycleMutex);
+                if (!freeDescriptorPools.empty())
+                {
+                    const VkDescriptorPool pool = freeDescriptorPools.back();
+                    freeDescriptorPools.pop_back();
+                    return pool;
+                }
+            }
+            constexpr uint32_t kSets = 2048;
+            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kSets}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets * 2},
+                                                  {VK_DESCRIPTOR_TYPE_SAMPLER, kSets}, {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, kSets}};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = kSets;
+            poolInfo.poolSizeCount = 4;
+            poolInfo.pPoolSizes = sizes;
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            check(vkCreateDescriptorPool(device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+            return pool;
+        }
+
+        VkCommandPool VulkanDevice::takeCommandPool()
+        {
+            {
+                std::lock_guard<std::mutex> lock(recycleMutex);
+                if (!freeCommandPools.empty())
+                {
+                    const VkCommandPool pool = freeCommandPools.back();
+                    freeCommandPools.pop_back();
+                    return pool;
+                }
+            }
+            VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            poolInfo.queueFamilyIndex = queueFamily;
+            VkCommandPool pool = VK_NULL_HANDLE;
+            vkCreateCommandPool(device, &poolInfo, nullptr, &pool);
+            return pool;
         }
 
         VkDescriptorSet VulkanCommandBuffer::allocateSet()
@@ -1443,15 +1515,8 @@ namespace gpu
                     if (vkAllocateDescriptorSets(owner->device, &info, &set) == VK_SUCCESS)
                         return set;
                 }
-                constexpr uint32_t kSets = 2048;
-                const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kSets}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets * 2},
-                                                      {VK_DESCRIPTOR_TYPE_SAMPLER, kSets}, {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, kSets}};
-                VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-                poolInfo.maxSets = kSets;
-                poolInfo.poolSizeCount = 4;
-                poolInfo.pPoolSizes = sizes;
-                VkDescriptorPool pool = VK_NULL_HANDLE;
-                if (!check(vkCreateDescriptorPool(owner->device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool"))
+                const VkDescriptorPool pool = owner->takeDescriptorPool();
+                if (!pool)
                     return VK_NULL_HANDLE;
                 retired->descriptorPools.push_back(pool);
             }
@@ -1646,6 +1711,8 @@ namespace gpu
                 vkCmdDraw(cb, count, 1, first, 0);
                 return;
             }
+            // One grid per thread, kept: building its 16k cells for every pass cost more than the draws themselves.
+            static thread_local OverlapRun run;
             uint32_t runStart = 0, runs = 0;
             run.begin();
             for (uint32_t at = 0; at + per <= count; at += per)
@@ -1800,8 +1867,19 @@ namespace gpu
                 for (VkFramebuffer f : next->framebuffers)
                     vkDestroyFramebuffer(device, f, nullptr);
                 for (VkDescriptorPool p : next->descriptorPools)
-                    vkDestroyDescriptorPool(device, p, nullptr);
-                vkDestroyCommandPool(device, next->pool, nullptr);
+                    vkResetDescriptorPool(device, p, 0);
+                if (next->commandBuffer)
+                    vkFreeCommandBuffers(device, next->pool, 1, &next->commandBuffer);
+                vkResetCommandPool(device, next->pool, 0);
+                {
+                    std::lock_guard<std::mutex> lock(recycleMutex);
+                    freeDescriptorPools.insert(freeDescriptorPools.end(), next->descriptorPools.begin(), next->descriptorPools.end());
+                    freeCommandPools.push_back(next->pool);
+                    for (UniformChunk &chunk : next->uniforms)
+                        freeUniformChunks.push_back(std::move(chunk.buffer));
+                }
+                next->descriptorPools.clear();
+                next->uniforms.clear();
                 std::shared_ptr<Completion> completion = next->completion;
                 next.reset(); // releases textures, buffers and pipelines the GPU was using
                 if (completion)
