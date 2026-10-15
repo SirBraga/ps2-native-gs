@@ -15,7 +15,7 @@
 
 #define RND(x) floor((x) + 0.5)
 
-#if defined(STAGE_VS_MAIN) || defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE) || defined(STAGE_FS_DEPTH_COPY) || defined(STAGE_FS_DEPTH_COPY_CLEAR)
+#if defined(STAGE_VS_MAIN) || defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE) || defined(STAGE_FS_HWBLEND) || defined(STAGE_FS_DEPTH_COPY) || defined(STAGE_FS_DEPTH_COPY_CLEAR)
 layout(set = 0, binding = 0, std140) uniform UniformBlock
 {
     float targetWidth, targetHeight;
@@ -123,7 +123,7 @@ void main()
 layout(input_attachment_index = 0, set = 0, binding = 4) uniform subpassInput destinationInput;
 #endif
 
-#if defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE) || defined(STAGE_FS_DEPTH_COPY) || defined(STAGE_FS_DEPTH_COPY_CLEAR)
+#if defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE) || defined(STAGE_FS_HWBLEND) || defined(STAGE_FS_DEPTH_COPY) || defined(STAGE_FS_DEPTH_COPY_CLEAR)
 layout(location = 0) noperspective in vec4 vColor;
 layout(location = 1) noperspective in vec3 vStq;
 layout(location = 2) noperspective in float vFog;
@@ -233,8 +233,12 @@ void main()
 }
 #endif
 
-#if defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE)
-layout(location = 0) out vec4 outColor;
+#if defined(STAGE_FS_MAIN) || defined(STAGE_FS_OPAQUE) || defined(STAGE_FS_HWBLEND)
+layout(location = 0, index = 0) out vec4 outColor;
+#if defined(STAGE_FS_HWBLEND)
+layout(location = 0, index = 1) out vec4 outFactor; // dual-source blend factor
+#endif
+float hwFactor = 1.0;
 
 // A render target's alpha channel used as an 8-bit texture: palette lookup per texel, filtered afterwards as the GS does.
 vec4 indexedTexel(vec2 at, vec2 size, uint paletteScale)
@@ -391,6 +395,23 @@ bool shade(vec4 destination, out vec4 result)
         if (pass != (S(alphaMode) == 1u))
             return false;
     }
+#if defined(STAGE_FS_HWBLEND)
+    // Fixed-function blending (GPUs without ordered reads of the target): this shader gives |ks| * Cs and the blend
+    // factor C/128 as a second output; the blend unit adds or subtracts kd * Cd (see hwBlend() in the renderer).
+    {
+        float f = 1.0, ks = 1.0;
+        if (S(abe) != 0u)
+        {
+            const float C = S(blendC) == 0u ? c.a : float(u.fix);
+            f = C / 128.0;
+            ks = (S(blendA) == 0u ? f : 0.0) - (S(blendB) == 0u ? f : 0.0) + (S(blendD) == 0u ? 1.0 : 0.0);
+        }
+        const float alphaOut = S(fba) != 0u && c.a < 128.0 ? c.a + 128.0 : c.a;
+        result = vec4(clamp(c.rgb * abs(ks), 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
+        hwFactor = f;
+        return true;
+    }
+#endif
     const vec4 d = RND(destination * 255.0);
     if (S(writeMode) == 1u)
     {
@@ -433,5 +454,8 @@ void main()
     if (!shade(destination, result))
         discard;
     outColor = result;
+#if defined(STAGE_FS_HWBLEND)
+    outFactor = vec4(hwFactor);
+#endif
 }
 #endif

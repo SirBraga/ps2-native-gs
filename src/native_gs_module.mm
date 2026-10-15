@@ -133,6 +133,9 @@ namespace
 #endif
             if (!device)
                 return false;
+            fixedBlend = device->prefersFixedBlend();
+            if (fixedBlend)
+                std::fprintf(stderr, "[native-gs] fixed-function blending where the GS formula allows (PS2X_GS_EXACT_BLEND=1 reads the target instead)\n");
             const auto make = [&](const char *vertex, const char *fragment, gpu::Format color, gpu::Format depth, gpu::VertexLayout layout) {
                 gpu::PipelineDesc desc;
                 desc.vertex = vertex;
@@ -923,10 +926,76 @@ namespace
         // One pipeline per combination of the path-selecting state (see GS_SPECIALIZED in the shader): compiled in the
         // background the first time the combination is drawn, the generic pipeline standing in until it is ready.
         bool specializedAvailable = false;
+        bool fixedBlend = false; // device->prefersFixedBlend(): see hwBlend()
+        uint64_t fixedBlendDraws = 0;
         struct Specialized { gpu::PipelineRef state; bool requested = false; };
         std::unordered_map<uint64_t, Specialized> specialized;
         std::mutex specializedMutex;
         uint64_t specializedDraws = 0, genericDraws = 0;
+        // Fixed-function blending for this draw, when the GPU prefers it (reads of the target need barriers there) and
+        // the GS formula maps onto it: ((A - B) * C >> 7) + D is ks * Cs + kd * Cd, where the shader gives |ks| * Cs and
+        // C/128 (second output) and the blend unit applies kd. Left to the destination-reading shader: C from the
+        // target's alpha, kd = 1 + C, both terms negative, wrapping colours (COLCLAMP off), write masks other than "no
+        // alpha", and reads of the target itself. Rounding differs from the GS by at most a step (it truncates (A-B)*C).
+        bool hwBlend(const Uniforms &u, gpu::BlendDesc &out) const
+        {
+            if (u.texSelf != 0u || (u.fbmask != 0u && u.fbmask != 0xFF000000u))
+                return false;
+            out = gpu::BlendDesc{};
+            out.writeMask = u.writeMode == 1u ? 0u : (u.writeMode == 2u || u.fbmask == 0xFF000000u) ? 0x7u : 0xFu;
+            if (u.abe == 0u)
+                return true;
+            if (u.blendC == 1u || u.colclamp == 0u)
+                return false;
+            const int fd = (u.blendA == 1u) - (u.blendB == 1u), od = u.blendD == 1u; // kd = fd * C + od
+            const int fs = (u.blendA == 0u) - (u.blendB == 0u), os = u.blendD == 0u; // ks = fs * C + os
+            if (fd == 1 && od == 1)
+                return false; // Cd * (1 + C)
+            const bool kdNegative = fd == -1 && od == 0, ksNegative = fs == -1 && os == 0;
+            if (kdNegative && ksNegative)
+                return false;
+            out.enabled = true;
+            out.src = gpu::BlendFactor::One;
+            out.dst = fd == 0 ? (od ? gpu::BlendFactor::One : gpu::BlendFactor::Zero) : fd == -1 && od ? gpu::BlendFactor::OneMinusSrc1Alpha : gpu::BlendFactor::Src1Alpha;
+            out.op = kdNegative ? gpu::BlendOp::Subtract : ksNegative ? gpu::BlendOp::ReverseSubtract : gpu::BlendOp::Add;
+            return true;
+        }
+        gpu::PipelineRef fixedBlendPipeline(const Uniforms &u)
+        {
+            gpu::BlendDesc blend;
+            if (!hwBlend(u, blend))
+                return nullptr;
+            const gpu::Specialization values = {u.tme, u.tfx, u.tcc, u.fge, u.abe, u.blendA, u.blendB, u.blendC, u.blendD, u.atst, u.alphaMode, u.writeMode, u.fba, u.colclamp,
+                                                u.destinationHasAlpha, u.texAlphaFixed, u.texIndexed, u.texLinear, u.wrapU, u.wrapV, u.texBox, u.texSelf,
+                                                u.maxLevel != 0u ? 1u : 0u, u.lodFixed != 0u ? 1u : 0u, 0u};
+            uint64_t key = 0x5EED0000u | (uint64_t(blend.enabled) << 1) | (uint64_t(blend.op) << 2) | (uint64_t(blend.src) << 4) | (uint64_t(blend.dst) << 6) | (uint64_t(blend.writeMask) << 8);
+            if (specializedAvailable)
+                for (uint32_t value : values)
+                    key = key * 11u + std::min(value, 10u);
+            {
+                std::lock_guard<std::mutex> lock(specializedMutex);
+                Specialized &entry = specialized[key];
+                if (entry.state || entry.requested)
+                    return entry.state;
+                entry.requested = true;
+            }
+            gpu::PipelineDesc desc;
+            desc.vertex = "vertexMain";
+            desc.fragment = "fragmentHwBlend";
+            desc.color = gpu::Format::RGBA8;
+            desc.depth = gpu::Format::Depth32F;
+            desc.layout = gpu::VertexLayout::GsVertex;
+            desc.specialized = specializedAvailable;
+            desc.constants = values;
+            desc.blend = blend;
+            Renderer *self = this;
+            device->pipelineAsync(desc, [self, key](gpu::PipelineRef state) {
+              std::lock_guard<std::mutex> ready(self->specializedMutex);
+              self->specialized[key].state = state;
+            });
+            return nullptr; // the destination-reading shader meanwhile
+        }
+
         gpu::PipelineRef specializedPipeline(const Uniforms &u, bool opaque)
         {
             if (!specializedAvailable)
@@ -2561,7 +2630,11 @@ namespace
                 u.alphaMode = alphaMode;
                 u.writeMode = writeMode;
                 const bool opaque = opaquePipeline && !noOpaque && u.abe == 0u && u.fbmask == 0u && writeMode == 0u && u.texSelf == 0u;
-                gpu::PipelineRef wanted = specializedPipeline(u, opaque);
+                gpu::PipelineRef wanted = !opaque && fixedBlend ? fixedBlendPipeline(u) : nullptr;
+                if (wanted)
+                    ++fixedBlendDraws;
+                else
+                    wanted = specializedPipeline(u, opaque);
                 if (wanted)
                     ++specializedDraws;
                 else

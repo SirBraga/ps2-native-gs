@@ -7,6 +7,7 @@
 #include "gpu.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -247,6 +248,8 @@ namespace gpu
 
             std::string name() const override { return device.name.UTF8String; }
             bool supportsBC() const override { return [device supportsBCTextureCompression]; }
+            // Apple GPUs read the target in order at no cost; PS2X_GS_FIXED_BLEND=1 forces fixed blending (to compare).
+            bool prefersFixedBlend() const override { static const bool forced = std::getenv("PS2X_GS_FIXED_BLEND") != nullptr; return forced; }
 
             TextureRef newTexture(const TextureDesc &desc) override
             {
@@ -330,6 +333,23 @@ namespace gpu
                 if (!descriptor.vertexFunction || !descriptor.fragmentFunction)
                     return nil;
                 descriptor.colorAttachments[0].pixelFormat = toMetal(desc.color);
+                if (desc.color != Format::Invalid)
+                {
+                    const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? MTLBlendFactorZero : f == BlendFactor::One ? MTLBlendFactorOne : f == BlendFactor::Src1Alpha ? MTLBlendFactorSource1Alpha : MTLBlendFactorOneMinusSource1Alpha; };
+                    MTLRenderPipelineColorAttachmentDescriptor *c = descriptor.colorAttachments[0];
+                    c.writeMask = ((desc.blend.writeMask & 1) ? MTLColorWriteMaskRed : 0) | ((desc.blend.writeMask & 2) ? MTLColorWriteMaskGreen : 0) |
+                                  ((desc.blend.writeMask & 4) ? MTLColorWriteMaskBlue : 0) | ((desc.blend.writeMask & 8) ? MTLColorWriteMaskAlpha : 0);
+                    if (desc.blend.enabled)
+                    {
+                        c.blendingEnabled = YES;
+                        c.rgbBlendOperation = desc.blend.op == BlendOp::Add ? MTLBlendOperationAdd : desc.blend.op == BlendOp::Subtract ? MTLBlendOperationSubtract : MTLBlendOperationReverseSubtract;
+                        c.sourceRGBBlendFactor = factor(desc.blend.src);
+                        c.destinationRGBBlendFactor = factor(desc.blend.dst);
+                        c.alphaBlendOperation = MTLBlendOperationAdd;
+                        c.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                        c.destinationAlphaBlendFactor = MTLBlendFactorZero;
+                    }
+                }
                 descriptor.depthAttachmentPixelFormat = toMetal(desc.depth);
                 if (desc.layout == VertexLayout::GsVertex)
                 {

@@ -50,6 +50,11 @@ reproduz, então o shader lê o pixel que está desenhando.
 - **Vulkan**: o alvo é também *input attachment*. Com `VK_EXT_rasterization_order_attachment_access` (AMD, entre
   outras) a ordem é garantida pela GPU; sem ela (NVIDIA, Intel), o desenho é dividido em grupos de triângulos que não
   se sobrepõem, com uma barreira entre grupos (teste exato de sobreposição; uma malha 3D vira um grupo só).
+- **Mistura fixa** (GPUs sem a extensão de ordem): toda draw cuja fórmula do GS cabe no blending da GPU usa o blending
+  fixo com *dual-source blending* (o shader calcula `|ks|·Cs` e o fator `C/128`), sem ler o alvo e sem barreiras; só
+  as fórmulas que não cabem continuam lendo o destino. Entre 7 e 87 vezes mais rápido nas cenas de teste via
+  MoltenVK; a diferença para o caminho exato é de arredondamento (1 a 3 tons, por camada). `PS2X_GS_EXACT_BLEND=1`
+  volta ao caminho exato; no Metal, `PS2X_GS_FIXED_BLEND=1` força a mistura fixa, para comparar.
 - `VK_EXT_extended_dynamic_state` é usado quando existe; sem ele, o estado de profundidade entra no pipeline.
 
 O backend Vulkan foi validado contra o Metal pixel a pixel (684 quadros de 7 cenas, em 1× e 4×, via MoltenVK).

@@ -23,7 +23,7 @@ compile fs_nibble frag -DSTAGE_FS_NIBBLE
 compile fs_depth_copy frag -DSTAGE_FS_DEPTH_COPY
 compile fs_depth_copy_clear frag -DSTAGE_FS_DEPTH_COPY_CLEAR
 # The main fragment shaders in every combination of the renderer's options (see gpu::ShaderOptions).
-for main in main opaque; do
+for main in main opaque hwblend; do
     upper=$(echo "$main" | tr a-z A-Z)
     compile "fs_${main}_trivial" frag "-DSTAGE_FS_$upper" -DGS_TRIVIAL
     for hw in "" _hwbil; do

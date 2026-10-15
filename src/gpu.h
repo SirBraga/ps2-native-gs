@@ -71,6 +71,18 @@ namespace gpu
     // Shader constants that pick the fragment shader's code paths (GS_SPECIALIZED): 25 values, see native_gs_module.
     using Specialization = std::array<uint32_t, 25>;
 
+    // Fixed-function blending of the colour output: result = output * src (op) target * dst, colour channels only;
+    // alpha is written as the shader gives it. Src1Alpha is the second (dual-source) output's alpha.
+    enum class BlendFactor : uint8_t { Zero, One, Src1Alpha, OneMinusSrc1Alpha };
+    enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract };
+    struct BlendDesc
+    {
+        bool enabled = false;
+        BlendOp op = BlendOp::Add;
+        BlendFactor src = BlendFactor::One, dst = BlendFactor::Zero;
+        uint8_t writeMask = 0xF; // bit 0 red .. bit 3 alpha
+    };
+
     struct PipelineDesc
     {
         std::string vertex, fragment; // shader function names
@@ -79,6 +91,7 @@ namespace gpu
         VertexLayout layout = VertexLayout::None;
         bool specialized = false;
         Specialization constants{};
+        BlendDesc blend;
     };
     class Pipeline { public: virtual ~Pipeline() = default; };
     using PipelineRef = std::shared_ptr<Pipeline>;
@@ -161,6 +174,9 @@ namespace gpu
         virtual ~Device() = default;
         virtual std::string name() const = 0;
         virtual bool supportsBC() const = 0;
+        // True when the shader's reads of the pixel it draws are expensive (they need barriers) and the GPU can blend
+        // with two source outputs: the renderer then blends in fixed function wherever the GS formula allows.
+        virtual bool prefersFixedBlend() const = 0;
 
         virtual TextureRef newTexture(const TextureDesc &desc) = 0;
         // Writes from the CPU right away (the texture must not be in use by queued work).

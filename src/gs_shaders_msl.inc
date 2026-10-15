@@ -233,7 +233,7 @@ fragment DepthAndColorOut depthCopyClearFragment(VertexOut in [[stage_in]], dept
     return out;
 }
 
-static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, texture2d<float> palette, sampler smp, constant Uniforms &u)
+static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, texture2d<float> palette, sampler smp, constant Uniforms &u, bool hwBlend, thread float &factorOut)
 {
 #if defined(GS_TRIVIAL)
     return float4(in.color.rgb / 255.0, 1.0); // PS2X_GS_NATIVE_TRIVIAL=1: what rasterizing alone costs (diagnostic)
@@ -389,6 +389,20 @@ static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, text
         bool pass = S(atst) == 0 ? false : S(atst) == 1 ? true : S(atst) == 2 ? a < r : S(atst) == 3 ? a <= r : S(atst) == 4 ? a == r : S(atst) == 5 ? a >= r : S(atst) == 6 ? a > r : a != r;
         if (pass != (S(alphaMode) == 1)) discard_fragment();
     }
+    if (hwBlend)
+    {
+        // Fixed-function blending (see gs_shaders.glsl, STAGE_FS_HWBLEND): |ks| * Cs, and the factor C/128 apart.
+        float f = 1.0, ks = 1.0;
+        if (S(abe) != 0)
+        {
+            const float C = S(blendC) == 0 ? c.a : float(u.fix);
+            f = C / 128.0;
+            ks = (S(blendA) == 0 ? f : 0.0) - (S(blendB) == 0 ? f : 0.0) + (S(blendD) == 0 ? 1.0 : 0.0);
+        }
+        const float alphaOut = S(fba) != 0 && c.a < 128.0 ? c.a + 128.0 : c.a;
+        factorOut = f;
+        return float4(clamp(c.rgb * abs(ks), 0.0, 255.0), clamp(alphaOut, 0.0, 255.0)) / 255.0;
+    }
     float4 d = round(destination * 255.0);
     if (S(writeMode) == 1) return destination;
     float3 rgb = c.rgb;
@@ -419,7 +433,8 @@ static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, text
 fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[color(0)]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
                              sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
 {
-    return shade(in, destination, tex, palette, smp, u);
+    float unused = 0.0;
+    return shade(in, destination, tex, palette, smp, u, false, unused);
 }
 
 // The same without that read, for draws that just replace the pixel (no blending, no write mask, not the
@@ -427,6 +442,24 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
 fragment float4 fragmentOpaque(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
                                sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
 {
-    return shade(in, float4(0.0), tex, palette, smp, u);
+    float unused = 0.0;
+    return shade(in, float4(0.0), tex, palette, smp, u, false, unused);
+}
+
+struct HwBlendOut
+{
+    float4 color [[color(0), index(0)]];
+    float4 factor [[color(0), index(1)]];
+};
+
+// Fixed-function blending: the blend unit mixes with the target (no read of it here).
+fragment HwBlendOut fragmentHwBlend(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
+                                    sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
+{
+    HwBlendOut out;
+    float factor = 1.0;
+    out.color = shade(in, float4(0.0), tex, palette, smp, u, true, factor);
+    out.factor = float4(factor);
+    return out;
 }
 )MSL"

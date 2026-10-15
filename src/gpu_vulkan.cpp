@@ -567,7 +567,7 @@ namespace gpu
             Allocator allocator;
             bool rasterOrder = false; // VK_EXT/ARM_rasterization_order_attachment_access
             bool dynamicDepth = false; // VK_EXT_extended_dynamic_state: depth test/write/compare set per draw
-            bool anisotropy = false, bc = false;
+            bool anisotropy = false, bc = false, dualSourceBlend = false;
             VkDeviceSize uniformAlignment = 256;
 
             VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
@@ -630,6 +630,7 @@ namespace gpu
 
             std::string name() const override { return properties.deviceName; }
             bool supportsBC() const override { return bc; }
+            bool prefersFixedBlend() const override { return !rasterOrder && dualSourceBlend && !std::getenv("PS2X_GS_EXACT_BLEND"); }
 
             TextureRef newTexture(const TextureDesc &desc) override;
             void replaceRegion(const TextureRef &texture, uint32_t level, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const void *data, uint32_t rowBytes) override;
@@ -826,6 +827,8 @@ namespace gpu
             features.samplerAnisotropy = supported.samplerAnisotropy;
             features.largePoints = supported.largePoints;
             features.textureCompressionBC = supported.textureCompressionBC;
+            features.dualSrcBlend = supported.dualSrcBlend;
+            dualSourceBlend = supported.dualSrcBlend == VK_TRUE;
             anisotropy = supported.samplerAnisotropy == VK_TRUE;
             bc = supported.textureCompressionBC == VK_TRUE;
 
@@ -1207,12 +1210,12 @@ namespace gpu
             static const std::map<std::string, std::string> names = {
                 {"vertexMain", "vs_main"}, {"quadVertex", "vs_quad"}, {"fragmentMain", "fs_main"}, {"fragmentOpaque", "fs_opaque"},
                 {"shuffleFragment", "fs_shuffle"}, {"presentFragment", "fs_present"}, {"depthAsColorFragment", "fs_depth_as_color"},
-                {"alphaNibbleFragment", "fs_nibble"}, {"depthCopyFragment", "fs_depth_copy"}, {"depthCopyClearFragment", "fs_depth_copy_clear"}};
+                {"alphaNibbleFragment", "fs_nibble"}, {"fragmentHwBlend", "fs_hwblend"}, {"depthCopyFragment", "fs_depth_copy"}, {"depthCopyClearFragment", "fs_depth_copy_clear"}};
             const auto found = names.find(function);
             if (found == names.end())
                 return function;
             std::string out = found->second;
-            if (out == "fs_main" || out == "fs_opaque")
+            if (out == "fs_main" || out == "fs_opaque" || out == "fs_hwblend")
             {
                 if (options.trivial)
                     return out + "_trivial";
@@ -1316,7 +1319,19 @@ namespace gpu
             depthStencil.depthCompareOp = depthKey % 3u == 0u ? VK_COMPARE_OP_ALWAYS : depthKey % 3u == 1u ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_GREATER_OR_EQUAL;
             depthStencil.depthWriteEnable = depthKey >= 3u ? VK_TRUE : VK_FALSE;
             VkPipelineColorBlendAttachmentState blend{};
-            blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            blend.colorWriteMask = ((desc.blend.writeMask & 1) ? VK_COLOR_COMPONENT_R_BIT : 0) | ((desc.blend.writeMask & 2) ? VK_COLOR_COMPONENT_G_BIT : 0) |
+                                   ((desc.blend.writeMask & 4) ? VK_COLOR_COMPONENT_B_BIT : 0) | ((desc.blend.writeMask & 8) ? VK_COLOR_COMPONENT_A_BIT : 0);
+            if (desc.blend.enabled)
+            {
+                const auto factor = [](BlendFactor f) { return f == BlendFactor::Zero ? VK_BLEND_FACTOR_ZERO : f == BlendFactor::One ? VK_BLEND_FACTOR_ONE : f == BlendFactor::Src1Alpha ? VK_BLEND_FACTOR_SRC1_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA; };
+                blend.blendEnable = VK_TRUE;
+                blend.colorBlendOp = desc.blend.op == BlendOp::Add ? VK_BLEND_OP_ADD : desc.blend.op == BlendOp::Subtract ? VK_BLEND_OP_SUBTRACT : VK_BLEND_OP_REVERSE_SUBTRACT;
+                blend.srcColorBlendFactor = factor(desc.blend.src);
+                blend.dstColorBlendFactor = factor(desc.blend.dst);
+                blend.alphaBlendOp = VK_BLEND_OP_ADD;
+                blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            }
             VkPipelineColorBlendStateCreateInfo colorBlend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
             if (color != VK_FORMAT_UNDEFINED)
             {
