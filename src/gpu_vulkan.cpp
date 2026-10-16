@@ -563,6 +563,26 @@ namespace gpu
             ~VulkanSwapchain() override;
             void pixelSize(uint32_t &width, uint32_t &height) override;
             DrawableRef nextDrawable(uint32_t width, uint32_t height) override;
+            void setVisible(bool visible) override
+            {
+#if defined(_WIN32)
+                // Hidden by moving it out of the way as well: some drivers keep showing a hidden child's last
+                // swapchain image.
+                if (child)
+                {
+                    if (visible)
+                    {
+                        RECT rect{};
+                        GetClientRect(parent, &rect);
+                        SetWindowPos(child, HWND_TOP, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                    }
+                    else
+                        SetWindowPos(child, nullptr, -32000, -32000, 1, 1, SWP_HIDEWINDOW | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                }
+#else
+                (void)visible;
+#endif
+            }
             bool recreate();
             void destroyImages();
         };
@@ -1232,7 +1252,7 @@ namespace gpu
         {
             static const std::map<std::string, std::string> names = {
                 {"vertexMain", "vs_main"}, {"quadVertex", "vs_quad"}, {"fragmentMain", "fs_main"}, {"fragmentOpaque", "fs_opaque"},
-                {"shuffleFragment", "fs_shuffle"}, {"presentFragment", "fs_present"}, {"depthAsColorFragment", "fs_depth_as_color"},
+                {"shuffleFragment", "fs_shuffle"}, {"presentFragment", "fs_present"}, {"aoFragment", "fs_ao"}, {"aoUpsampleFragment", "fs_ao_upsample"}, {"smaaEdgeFragment", "fs_smaa_edge"}, {"smaaWeightFragment", "fs_smaa_weight"}, {"smaaBlendFragment", "fs_smaa_blend"}, {"depthAsColorFragment", "fs_depth_as_color"},
                 {"alphaNibbleFragment", "fs_nibble"}, {"fragmentHwBlend", "fs_hwblend"}, {"depthCopyFragment", "fs_depth_copy"}, {"depthCopyClearFragment", "fs_depth_copy_clear"}};
             const auto found = names.find(function);
             if (found == names.end())

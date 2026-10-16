@@ -20,6 +20,8 @@ Nasceu na recompilação de *Silent Hill Origins* e é o renderizador padrão do
   outro formato (visões de 16 bits de um alvo de 32 bits, profundidade lida como cor, cópias do canal alfa).
 - **Shaders especializados** por combinação de estado, compilados em segundo plano.
 - **Substituição de texturas** compatível com os pacotes HD do PCSX2 (mesmos hashes).
+- **Efeitos de imagem modernos, todos opcionais** (desligados por padrão): nitidez adaptativa, oclusão de ambiente e
+  SMAA (ver abaixo).
 - **Ferramentas de validação**: grava a entrada do GS de uma cena (gs-dump) e a reproduz em qualquer módulo
   (`gs-replay`), comparando quadro a quadro.
 
@@ -59,6 +61,29 @@ reproduz, então o shader lê o pixel que está desenhando.
 
 O backend Vulkan foi validado contra o Metal pixel a pixel (684 quadros de 7 cenas, em 1× e 4×, via MoltenVK).
 
+## Efeitos de imagem
+
+Os efeitos não mudam nada com eles desligados; cada um é ligado à parte.
+
+- **A cena 3D separada do 2D.** Os efeitos não devem atingir o que o jogo desenha por cima do 3D (granulado de filme,
+  vinhetas, HUD, menus). O renderizador acompanha cada quadro e, quando o jogo passa de desenhos com teste de
+  profundidade para desenhos sem ele, tira uma cópia do alvo na GPU. A última cópia do quadro é o 3D antes do 2D.
+  Os efeitos são calculados sobre essa cópia, e só a mudança que eles fazem é somada à imagem final: proporcional
+  onde o 2D só escureceu a cena (fades, vinhetas) e nula onde o 2D a substituiu (HUD). Não depende do jogo: é a regra
+  de profundidade do próprio GS. A estrutura do quadro anterior diz qual transição é a última, para copiar uma vez só.
+- **Nitidez** (`PS2X_GS_NATIVE_SHARPEN=0..1`): realce adaptativo ao contraste, no estilo do CAS da AMD.
+- **Oclusão de ambiente** (`PS2X_GS_NATIVE_AO=0..1`): sombra nos cantos e onde objetos se encostam, só a partir do
+  buffer de profundidade, sem conhecer a projeção do jogo. O GS interpola o Z de forma linear na tela, então numa
+  superfície plana a média de dois pontos opostos em volta de um pixel é o Z do próprio pixel; onde a média fica à
+  frente, há uma dobra côncava. Pares que atravessam um salto de profundidade (silhuetas) são ignorados. É calculada
+  uma vez por quadro, na resolução do jogo, e ampliada respeitando a profundidade (*joint bilateral upsample*).
+- **SMAA 1x** (`PS2X_GS_NATIVE_SMAA=1`, no lugar do FXAA): porte da implementação de referência (preset ULTRA, sem
+  detecção diagonal). Uma borda só conta se aparece na imagem final e na cópia da cena: o granulado não vira borda e
+  o HUD não é borrado.
+
+Diagnóstico com o `gs-replay`: `PS2X_GS_NATIVE_SCANOUT_PRESENT=1` devolve a imagem como a janela a recebe (com os
+efeitos), `PS2X_GS_NATIVE_SCANOUT_SCENE=1` a cópia da cena, e com `PS2X_GS_NATIVE_SCANOUT_AO=1` só a oclusão.
+
 ## Compilar
 
 Requisitos: CMake 3.20+, Ninja, um compilador C++20 (Clang/Xcode no macOS; llvm-mingw ou MSVC/Clang no Windows).
@@ -91,7 +116,10 @@ O runtime carrega o módulo pelo caminho em `PS2X_GS_PARALLEL_MODULE`. As opçõ
 | `PS2X_GS_NATIVE_SCALE=1..8` | resolução interna (múltiplo da do jogo) |
 | `PS2X_GS_NATIVE_PRESENT=1` | desenha direto na janela (Metal layer / janela-filha Vulkan) |
 | `PS2X_GS_NATIVE_GAMMA`, `PS2X_GS_NATIVE_BRIGHTNESS` | ajuste de imagem na saída |
-| `PS2X_GS_NATIVE_FXAA=0` | desliga a suavização de bordas |
+| `PS2X_GS_NATIVE_FXAA=0` | desliga a suavização de bordas (FXAA) |
+| `PS2X_GS_NATIVE_SMAA=1` | SMAA no lugar do FXAA |
+| `PS2X_GS_NATIVE_SHARPEN=0..1` | nitidez (0 = desligada) |
+| `PS2X_GS_NATIVE_AO=0..1`, `PS2X_GS_NATIVE_AO_RADIUS` | oclusão de ambiente (0 = desligada) e o raio, em pixels do jogo |
 | `PS2X_TEXTURE_PACKS=<pasta>` | pacotes de texturas HD (formato PCSX2) |
 | `PS2X_GS_DUMP=<arquivo>` + `PS2X_GS_DUMP_REQUEST=<arquivo>` | grava uma cena para o `gs-replay` |
 | `PS2X_GS_MOLTENVK=<libMoltenVK.dylib>` | (macOS) Vulkan via MoltenVK |
@@ -114,5 +142,6 @@ justamente a correção pretendida.
 
 ## Licença
 
-GPL-3.0 (ver `LICENSE`). Inclui código do [PS2Recomp](https://github.com/ran-j/PS2Recomp) (layout de memória do GS) e o
-xxHash (BSD 2-Clause, em `src/third_party`). Nenhum dado de jogo (ELF, ISO, dumps) faz parte deste repositório.
+GPL-3.0 (ver `LICENSE`). Inclui código do [PS2Recomp](https://github.com/ran-j/PS2Recomp) (layout de memória do GS), o
+xxHash (BSD 2-Clause) e as tabelas do [SMAA](https://github.com/iryoku/smaa) (MIT, Jimenez et al.), em `src/third_party`;
+os passos do SMAA nos shaders são um porte da implementação de referência. Nenhum dado de jogo (ELF, ISO, dumps) faz parte deste repositório.

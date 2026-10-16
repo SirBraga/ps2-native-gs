@@ -18,6 +18,11 @@ compile vs_main vert -DSTAGE_VS_MAIN
 compile vs_quad vert -DSTAGE_VS_QUAD
 compile fs_shuffle frag -DSTAGE_FS_SHUFFLE
 compile fs_present frag -DSTAGE_FS_PRESENT
+compile fs_ao frag -DSTAGE_FS_AO
+compile fs_ao_upsample frag -DSTAGE_FS_AO_UPSAMPLE
+compile fs_smaa_edge frag -DSTAGE_FS_SMAA_EDGE
+compile fs_smaa_weight frag -DSTAGE_FS_SMAA_WEIGHT
+compile fs_smaa_blend frag -DSTAGE_FS_SMAA_BLEND
 compile fs_depth_as_color frag -DSTAGE_FS_DEPTH_AS_COLOR
 compile fs_nibble frag -DSTAGE_FS_NIBBLE
 compile fs_depth_copy frag -DSTAGE_FS_DEPTH_COPY

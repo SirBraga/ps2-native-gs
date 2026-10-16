@@ -190,6 +190,11 @@ namespace gpu
                 width = uint32_t(layer.bounds.size.width * layer.contentsScale);
                 height = uint32_t(layer.bounds.size.height * layer.contentsScale);
             }
+            void setVisible(bool visible) override
+            {
+                BlackNativeGSView *v = view;
+                dispatch_async(dispatch_get_main_queue(), ^{ v.hidden = !visible; });
+            }
             DrawableRef nextDrawable(uint32_t width, uint32_t height) override
             {
                 layer.drawableSize = CGSizeMake(width, height);

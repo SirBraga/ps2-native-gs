@@ -22,6 +22,8 @@
 #endif
 #include "gs_decode.h"
 #include "runtime/gs/gs_parallel_api.h"
+#include "third_party/smaa/AreaTex.h"   // SMAA lookup tables (MIT licence, Jimenez et al.)
+#include "third_party/smaa/SearchTex.h"
 
 #include <atomic>
 #include <chrono>
@@ -164,6 +166,38 @@ namespace
                 dummyDepthTexture = device->newTexture(d);
             }
             presentPipeline = make("quadVertex", "presentFragment", F::BGRA8, F::Invalid, V::None);
+            {
+                // Ambient occlusion into the alpha of a target's scene copy (Target::scene), which the screen never shows.
+                gpu::PipelineDesc desc;
+                desc.vertex = "quadVertex";
+                desc.fragment = "aoFragment";
+                desc.color = F::RGBA8;
+                aoPipeline = device->pipeline(desc);
+                desc.fragment = "aoUpsampleFragment";
+                desc.blend.writeMask = 0x8u;
+                aoUpsamplePipeline = device->pipeline(desc);
+            }
+            smaaEdgePipeline = make("quadVertex", "smaaEdgeFragment", F::RGBA8, F::Invalid, V::None);
+            smaaWeightPipeline = make("quadVertex", "smaaWeightFragment", F::RGBA8, F::Invalid, V::None);
+            smaaBlendPipeline = make("quadVertex", "smaaBlendFragment", F::RGBA8, F::Invalid, V::None);
+            {
+                // SMAA's area table (160x560, two channels) with its search table (64x16) in the rows below.
+                gpu::TextureDesc d;
+                d.width = AREATEX_WIDTH;
+                d.height = AREATEX_HEIGHT + SEARCHTEX_HEIGHT;
+                smaaTables = device->newTexture(d);
+                std::vector<uint8_t> rgba(size_t(d.width) * d.height * 4u, 0u);
+                for (uint32_t y = 0; y < AREATEX_HEIGHT; ++y)
+                    for (uint32_t x = 0; x < AREATEX_WIDTH; ++x)
+                    {
+                        rgba[(size_t(y) * d.width + x) * 4u] = areaTexBytes[y * AREATEX_PITCH + x * 2u];
+                        rgba[(size_t(y) * d.width + x) * 4u + 1u] = areaTexBytes[y * AREATEX_PITCH + x * 2u + 1u];
+                    }
+                for (uint32_t y = 0; y < SEARCHTEX_HEIGHT; ++y)
+                    for (uint32_t x = 0; x < SEARCHTEX_WIDTH; ++x)
+                        rgba[(size_t(AREATEX_HEIGHT + y) * d.width + x) * 4u] = searchTexBytes[y * SEARCHTEX_PITCH + x];
+                device->replaceRegion(smaaTables, 0, 0, 0, d.width, d.height, rgba.data(), d.width * 4u);
+            }
             resolvePipeline = make("quadVertex", "presentFragment", F::RGBA8, F::Invalid, V::None);
             depthAsColorPipeline = make("quadVertex", "depthAsColorFragment", F::RGBA8, F::Invalid, V::None);
             alphaNibblePipeline = make("quadVertex", "alphaNibbleFragment", F::RGBA8, F::Invalid, V::None);
@@ -564,18 +598,23 @@ namespace
             }
             // Several rectangles sent to one base (mip levels packed in a page) add up to one piece of content.
             UploadRecord &record = uploads[dbp];
+            if (!record.member)
+                record.member = std::make_unique<std::bitset<kVramBytes / 256u>>();
             if (atOrigin)
             {
                 record.hash = hash;
-                record.blocks = blocks;
+                for (const uint16_t block : record.blocks)
+                    record.member->reset(block);
+                record.blocks.clear();
             }
             else
-            {
                 record.hash = record.hash * 0x100000001b3ull ^ hash;
-                record.blocks.insert(record.blocks.end(), blocks.begin(), blocks.end());
-                std::sort(record.blocks.begin(), record.blocks.end());
-                record.blocks.erase(std::unique(record.blocks.begin(), record.blocks.end()), record.blocks.end());
-            }
+            for (const uint16_t block : blocks)
+                if (!record.member->test(block))
+                {
+                    record.member->set(block);
+                    record.blocks.push_back(block);
+                }
             record.blockSum = generationSum(record.blocks);
             for (const uint16_t block : blocks)
                 blockOwner[block] = uint16_t(dbp + 1u);
@@ -654,10 +693,66 @@ namespace
 
         // Direct presentation: the backend's layer/surface over the window, fed from the displayed target without a
         // trip through the CPU.
+        // Display options the in-game menu changes while the game runs (black_native_gs_set_option). Start values:
+        // PS2X_GS_NATIVE_FXAA (0 off), PS2X_GS_NATIVE_GAMMA (>1 lifts dark tones), PS2X_GS_NATIVE_BRIGHTNESS,
+        // PS2X_GS_NATIVE_SHARPEN (0..1, 0 off), PS2X_GS_NATIVE_AO (ambient occlusion strength 0..1, 0 off).
+        std::atomic<float> optionFxaa{[] { const char *v = std::getenv("PS2X_GS_NATIVE_FXAA"); return (v && v[0] == '0') ? 0.0f : 1.0f; }()};
+        std::atomic<float> optionGamma{[] { const char *v = std::getenv("PS2X_GS_NATIVE_GAMMA"); const float g = v ? float(std::atof(v)) : 1.0f; return (g > 0.2f && g < 5.0f) ? g : 1.0f; }()};
+        std::atomic<float> optionSharpen{[] { const char *v = std::getenv("PS2X_GS_NATIVE_SHARPEN"); const float s = v ? float(std::atof(v)) : 0.0f; return std::clamp(s, 0.0f, 1.0f); }()};
+        std::atomic<float> optionAo{[] { const char *v = std::getenv("PS2X_GS_NATIVE_AO"); const float s = v ? float(std::atof(v)) : 0.0f; return std::clamp(s, 0.0f, 1.0f); }()};
+        // PS2X_GS_NATIVE_SMAA=1: SMAA instead of the FXAA-like filter of the present pass.
+        std::atomic<float> optionSmaa{[] { const char *v = std::getenv("PS2X_GS_NATIVE_SMAA"); return (v && v[0] == '1') ? 1.0f : 0.0f; }()};
+        std::atomic<float> optionBrightness{[] { const char *v = std::getenv("PS2X_GS_NATIVE_BRIGHTNESS"); const float b = v ? float(std::atof(v)) : 1.0f; return (b > 0.1f && b < 4.0f) ? b : 1.0f; }()};
+        void setOption(const char *key, float value)
+        {
+            if (std::strcmp(key, "sharpen") == 0)
+                optionSharpen.store(std::clamp(value, 0.0f, 1.0f));
+            else if (std::strcmp(key, "ao") == 0)
+                optionAo.store(std::clamp(value, 0.0f, 1.0f));
+            else if (std::strcmp(key, "smaa") == 0)
+                optionSmaa.store(value != 0.0f ? 1.0f : 0.0f);
+            else if (std::strcmp(key, "fxaa") == 0)
+                optionFxaa.store(value != 0.0f ? 1.0f : 0.0f);
+            else if (std::strcmp(key, "gamma") == 0 && value > 0.2f && value < 5.0f)
+                optionGamma.store(value);
+            else if (std::strcmp(key, "brightness") == 0 && value > 0.1f && value < 4.0f)
+                optionBrightness.store(value);
+        }
+        void setPictureVisible(bool visible)
+        {
+            if (swapchain)
+                swapchain->setVisible(visible);
+        }
+
         bool attachWindow(void *window)
         {
             swapchain = device->attachWindow(window);
             return swapchain != nullptr;
+        }
+
+    private:
+        struct Target;
+    public:
+        // The displayed part of a target with the picture options and effects, into a pass of outW x outH pixels.
+        void encodePresent(gpu::RenderEncoder &quad, Target &shown, uint32_t fbw, uint32_t dbx, uint32_t dby, uint32_t width, uint32_t height, uint32_t outW, uint32_t outH,
+                           const gpu::TextureRef &picture)
+        {
+            const bool smaa = picture != shown.color; // already antialiased (runSmaa)
+            const float fxaa = smaa ? 0.0f : optionFxaa.load(std::memory_order_relaxed);
+            // PS2X_GS_NATIVE_GAMMA (>1 lifts dark tones) and PS2X_GS_NATIVE_BRIGHTNESS (overall gain), both 1 by default.
+            const float gamma = optionGamma.load(std::memory_order_relaxed), brightness = optionBrightness.load(std::memory_order_relaxed);
+            // With the picture of the 3D part (Target::scene) at hand, the effects work on it; without it, on what is shown.
+            const bool useScene = shown.sceneValid && shown.scene && sceneEffectsOn();
+            const bool useAo = useScene && shown.sceneHasAo && optionAo.load(std::memory_order_relaxed) > 0.0f;
+            const float uniforms[10] = {float(dbx) / float(fbw * 64u), float(dby) / float(kTargetHeight),
+                                        float(width) / float(fbw * 64u) / float(outW), float(height) / float(kTargetHeight) / float(outH),
+                                        fxaa, gamma, brightness, optionSharpen.load(std::memory_order_relaxed), useScene ? 1.0f : 0.0f, useAo ? 1.0f : 0.0f};
+            quad.setPipeline(presentPipeline);
+            quad.setFragmentTexture(picture, 0);
+            quad.setFragmentTexture(useScene ? shown.scene : shown.color, 1);
+            quad.setFragmentSampler(sampler(true, 1, 1), 0);
+            quad.setFragmentBytes(uniforms, sizeof(uniforms));
+            quad.draw(gpu::Primitive::Triangle, 0, 3);
         }
 
         int present(uint32_t fbp, uint32_t fbw, uint32_t psm, uint32_t dbx, uint32_t dby, uint32_t width, uint32_t height, GSParallelScanout &request)
@@ -678,6 +773,8 @@ namespace
             uint32_t pixelsW = 0, pixelsH = 0;
             swapchain->pixelSize(pixelsW, pixelsH);
             const bool toWindow = windowRes && pixelsW >= 16u && pixelsH >= 16u;
+            ensureSceneAo(shown);
+            const gpu::TextureRef picture = runSmaa(shown);
             gpu::DrawableRef drawable = swapchain->nextDrawable(toWindow ? pixelsW : width * scale, toWindow ? pixelsH : height * scale);
             if (!drawable)
                 return 0;
@@ -687,18 +784,8 @@ namespace
             pass.color = drawable->texture;
             pass.colorLoad = gpu::Load::DontCare;
             auto quad = commandBuffer->renderPass(pass);
-            static const float fxaa = [] { const char *v = std::getenv("PS2X_GS_NATIVE_FXAA"); return (v && v[0] == '0') ? 0.0f : 1.0f; }();
-            // PS2X_GS_NATIVE_GAMMA (>1 lifts dark tones) and PS2X_GS_NATIVE_BRIGHTNESS (overall gain), both 1 by default.
-            static const float gamma = [] { const char *v = std::getenv("PS2X_GS_NATIVE_GAMMA"); const float g = v ? float(std::atof(v)) : 1.0f; return (g > 0.2f && g < 5.0f) ? g : 1.0f; }();
-            static const float brightness = [] { const char *v = std::getenv("PS2X_GS_NATIVE_BRIGHTNESS"); const float b = v ? float(std::atof(v)) : 1.0f; return (b > 0.1f && b < 4.0f) ? b : 1.0f; }();
-            const float uniforms[7] = {float(dbx) / float(fbw * 64u), float(dby) / float(kTargetHeight),
-                                       float(width) / float(fbw * 64u) / float(drawable->texture->width), float(height) / float(kTargetHeight) / float(drawable->texture->height),
-                                       fxaa, gamma, brightness};
-            quad->setPipeline(presentPipeline);
-            quad->setFragmentTexture(shown.color, 0);
-            quad->setFragmentSampler(sampler(true, 1, 1), 0);
-            quad->setFragmentBytes(uniforms, sizeof(uniforms));
-            quad->draw(gpu::Primitive::Triangle, 0, 3);
+            encodePresent(*quad, shown, fbw, dbx, dby, width, height, drawable->texture->width, drawable->texture->height, picture);
+            shown.scenePresented = true;
             quad->end();
             drawable->onPresented([](double presentedTime) {
               const uint64_t at = uint64_t(presentedTime * 1e9);
@@ -806,7 +893,62 @@ namespace
                 if (width == 0u || height == 0u)
                     return 0;
                 const uint32_t scale = scaleOf(fbw);
-                if (scale == 1u)
+                // PS2X_GS_NATIVE_SCANOUT_PRESENT=1 (diagnostic, for gs-replay): the frame as the window would get it, through
+                // the present pass with the picture options and effects. PS2X_GS_NATIVE_SCANOUT_SCENE=1: the copy of the
+                // frame's 3D part those effects use (Target::scene).
+                static const bool viaPresent = GS_ENV_FLAG("PS2X_GS_NATIVE_SCANOUT_PRESENT"), sceneOnly = GS_ENV_FLAG("PS2X_GS_NATIVE_SCANOUT_SCENE");
+                if ((viaPresent || sceneOnly) && width * scale * 4u <= request.stride && height * scale <= request.maxHeight)
+                {
+                    flush(true); // what the target holds is finished, as for the other readbacks
+                    ensureSceneAo(target);
+                    const uint32_t w = width * scale, h = height * scale;
+                    gpu::TextureDesc d;
+                    d.width = w;
+                    d.height = h;
+                    d.usage = gpu::RenderTarget;
+                    d.storage = gpu::Storage::Shared;
+                    d.format = gpu::Format::BGRA8;
+                    gpu::TextureRef out = device->newTexture(d);
+                    if (sceneOnly && !(target.sceneValid && target.scene))
+                        std::memset(request.rgba, 0, size_t(w) * h * 4u);
+                    else if (sceneOnly)
+                    {
+                        d.format = target.scene->format; // a private texture: read through a shared copy
+                        d.usage = gpu::ShaderRead;
+                        gpu::TextureRef copy = device->newTexture(d);
+                        endPass();
+                        ensureCommandBuffer();
+                        auto blit = commandBuffer->blit();
+                        blit->copyTexture(target.scene, dbx * scale, dby * scale, w, h, copy, 0, 0);
+                        blit->end();
+                        flush(true);
+                        device->getBytes(copy, 0, 0, w, h, request.rgba, w * 4u);
+                        // PS2X_GS_NATIVE_SCANOUT_AO=1 as well: the ambient occlusion (the copy's alpha) as grey.
+                        if (GS_ENV_FLAG("PS2X_GS_NATIVE_SCANOUT_AO"))
+                            for (size_t i = 0, n = size_t(w) * h; i < n; ++i)
+                                request.rgba[i * 4u] = request.rgba[i * 4u + 1u] = request.rgba[i * 4u + 2u] = target.sceneHasAo ? request.rgba[i * 4u + 3u] : 0u;
+                    }
+                    else
+                    {
+                        const gpu::TextureRef picture = runSmaa(target);
+                        endPass();
+                        ensureCommandBuffer();
+                        gpu::PassDesc pass;
+                        pass.color = out;
+                        pass.colorLoad = gpu::Load::DontCare;
+                        auto quad = commandBuffer->renderPass(pass);
+                        encodePresent(*quad, target, fbw, dbx, dby, width, height, w, h, picture);
+                        quad->end();
+                        flush(true);
+                        device->getBytes(out, 0, 0, w, h, request.rgba, w * 4u);
+                        for (size_t i = 0, n = size_t(w) * h; i < n; ++i)
+                            std::swap(request.rgba[i * 4u], request.rgba[i * 4u + 2u]); // BGRA as the window takes it
+                    }
+                    target.scenePresented = true;
+                    width = w;
+                    height = h;
+                }
+                else if (scale == 1u)
                     device->getBytes(target.color, dbx, dby, width, height, request.rgba, width * 4u);
                 else if (width * scale * 4u <= request.stride && height * scale <= request.maxHeight)
                 {
@@ -884,6 +1026,16 @@ namespace
             std::bitset<kVramBytes / 256u> gpuDirty; // blocks (absolute) drawn to since VRAM last received them
             uint64_t markedRect = ~0ull;     // the rectangle gpuDirty already covers (most draws repeat it)
             uint32_t usedRows = 0; // how far down anything was drawn: the memory below belongs to something else
+            // The picture as it was when the game last went from depth-tested (3D) draws to draws without a depth test,
+            // which is where its 2D work starts: overlays, film grain, the HUD. Picture effects are computed on it and
+            // only the change they make is added to what is shown, so what was drawn after the 3D is left alone. Taken
+            // only while an effect that needs it is on (see noteSceneBatch).
+            gpu::TextureRef scene, sceneDepth; // and the Z buffer at that moment, for ambient occlusion
+            gpu::TextureRef ao;                // that occlusion at the game's resolution
+            bool inScene = false, sceneValid = false, scenePresented = false, sceneHasAo = false, sceneDepthValid = false;
+            // 3D-to-2D transitions in this frame and in the one before: frames repeat their structure, so only the
+            // transitions from the last one the previous frame had on are copied (the earlier copies would be replaced).
+            uint32_t sceneTransitions = 0, sceneTransitionsBefore = 0;
             uint32_t pageCount() const
             {
                 const uint32_t pageHeight = psm == 2u || psm == 0xAu ? 64u : 32u;
@@ -1066,6 +1218,9 @@ namespace
             });
             return nullptr;
         }
+        gpu::PipelineRef aoPipeline, aoUpsamplePipeline;
+        gpu::PipelineRef smaaEdgePipeline, smaaWeightPipeline, smaaBlendPipeline;
+        gpu::TextureRef smaaTables, smaaEdges, smaaWeights, smaaOut;
         gpu::PipelineRef pipeline, depthCopyPipeline, depthCopyClearPipeline, shufflePipeline, presentPipeline, resolvePipeline, depthAsColorPipeline, alphaNibblePipeline,
             shuffleInPassPipeline;
         gpu::TextureRef dummyDepthTexture;
@@ -1098,6 +1253,9 @@ namespace
         {
             uint64_t hash = 0, blockSum = 0;
             std::vector<uint16_t> blocks;
+            // Membership of `blocks`, for pieces that add up (a video frame arrives in hundreds of small transfers to
+            // one base: merging them by sorting the whole list each time took a second per frame on a laptop).
+            std::unique_ptr<std::bitset<kVramBytes / 256u>> member;
         };
         std::unordered_map<uint32_t, UploadRecord> uploads;
         std::unordered_map<uint64_t, UploadRecord> rectangles; // by destination rectangle: the last transfer written there
@@ -1271,6 +1429,8 @@ namespace
         uint64_t windowGpu = 0, windowWorst = 0, windowLate = 0, windowCount = 0, lastGpu = 0, windowPasses = 0, windowDraws = 0, windowPrimitives = 0, windowCopies = 0;
         void noteScanout()
         {
+            if (logging())
+                std::fprintf(stderr, "[scanout] %llu\n", (unsigned long long)scanouts);
             batchIndexInScanout = 0;
             const uint64_t total = g_gpuNanoseconds.load(std::memory_order_relaxed), spent = total - lastGpu;
             lastGpu = total;
@@ -2236,6 +2396,182 @@ namespace
 
         uint32_t batchIndexInScanout = 0;
 
+        bool sceneEffectsOn() const
+        {
+            return (optionSharpen.load(std::memory_order_relaxed) > 0.0f || optionAo.load(std::memory_order_relaxed) > 0.0f || optionSmaa.load(std::memory_order_relaxed) > 0.0f) &&
+                   !GS_ENV_FLAG("PS2X_GS_NATIVE_NO_SCENE");
+        }
+
+        // Follows the 3D part of each frame on the target a batch draws to (see Target::scene).
+        void noteSceneBatch(uint32_t fbp, uint32_t fbw, uint32_t psm, uint32_t test, uint32_t zbp)
+        {
+            if (psm != 0u && psm != 1u)
+                return;
+            const auto found = targets.find(targetKey(fbp, fbw));
+            if (found == targets.end() || !found->second.color)
+                return;
+            Target &t = found->second;
+            if (t.scenePresented)
+            {
+                // The first draw after the target was shown: a new frame, the old picture no longer belongs to it.
+                t.scenePresented = false;
+                t.sceneValid = false;
+                t.inScene = false;
+                t.sceneTransitionsBefore = t.sceneTransitions;
+                t.sceneTransitions = 0;
+            }
+            const bool depthTested = (test & 0x10000u) != 0u && ((test >> 17) & 3u) >= 2u; // ZTE with GEQUAL or GREATER
+            if (depthTested)
+            {
+                t.inScene = true;
+                return;
+            }
+            if (!t.inScene)
+                return;
+            // 3D ends here (for now: when more 3D follows, a later copy replaces this one).
+            t.inScene = false;
+            if (++t.sceneTransitions < t.sceneTransitionsBefore && !GS_ENV_FLAG("PS2X_GS_NATIVE_SCENE_EVERY"))
+            {
+                t.sceneValid = false; // not the last one, judging by the frame before
+                return;
+            }
+            endPass();
+            ensureCommandBuffer();
+            if (!t.scene || t.scene->width != t.color->width || t.scene->height != t.color->height)
+            {
+                gpu::TextureDesc d;
+                d.format = t.color->format;
+                d.width = t.color->width;
+                d.height = t.color->height;
+                d.storage = gpu::Storage::Private;
+                t.scene = device->newTexture(d);
+            }
+            const uint32_t rows = std::min(t.color->height, std::max(t.usedRows, 1u) * scaleOf(t.fbw));
+            auto blit = commandBuffer->blit();
+            blit->copyTexture(t.color, 0, 0, t.color->width, rows, t.scene, 0, 0);
+            blit->end();
+            t.sceneValid = true;
+            t.sceneHasAo = false;
+            t.sceneDepthValid = false;
+            ++sceneCopies;
+            // The Z buffer as the 3D left it, for the ambient occlusion worked out once the frame is shown (ensureSceneAo):
+            // by then the game may be drawing the next frame into it (both of its colour buffers share one Z buffer).
+            const auto zfound = depths.find(targetKey(zbp, fbw));
+            if (optionAo.load(std::memory_order_relaxed) > 0.0f && aoPipeline && zfound != depths.end() && zfound->second.texture &&
+                zfound->second.texture->width == t.scene->width && zfound->second.texture->height == t.scene->height)
+            {
+                if (!t.sceneDepth || t.sceneDepth->width != t.scene->width || t.sceneDepth->height != t.scene->height)
+                {
+                    gpu::TextureDesc d;
+                    d.format = gpu::Format::Depth32F;
+                    d.width = t.scene->width;
+                    d.height = t.scene->height;
+                    d.usage = gpu::ShaderRead | gpu::RenderTarget;
+                    d.storage = gpu::Storage::Private;
+                    t.sceneDepth = device->newTexture(d);
+                }
+                auto zblit = commandBuffer->blit();
+                zblit->copyTexture(zfound->second.texture, 0, 0, t.scene->width, t.scene->height, t.sceneDepth, 0, 0);
+                zblit->end();
+                t.sceneDepthValid = true;
+            }
+        }
+        uint64_t sceneCopies = 0;
+
+        // SMAA 1x over a whole target (the three passes of the reference): the antialiased picture the present pass shows, or
+        // the target itself when SMAA is off.
+        gpu::TextureRef runSmaa(Target &t)
+        {
+            if (optionSmaa.load(std::memory_order_relaxed) == 0.0f || !smaaEdgePipeline || !smaaWeightPipeline || !smaaBlendPipeline || !smaaTables || !t.color)
+                return t.color;
+            const uint32_t w = t.color->width, h = t.color->height;
+            const auto ensure = [&](gpu::TextureRef &texture) {
+                if (texture && texture->width == w && texture->height == h)
+                    return;
+                gpu::TextureDesc d;
+                d.width = w;
+                d.height = h;
+                d.usage = gpu::RenderTarget | gpu::ShaderRead;
+                d.storage = gpu::Storage::Private;
+                texture = device->newTexture(d);
+            };
+            ensure(smaaEdges);
+            ensure(smaaWeights);
+            ensure(smaaOut);
+            endPass();
+            ensureCommandBuffer();
+            const bool useScene = t.sceneValid && t.scene && sceneEffectsOn();
+            const float uniforms[8] = {1.0f / float(w), 1.0f / float(h), float(w), float(h), useScene ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
+            const auto run = [&](const gpu::PipelineRef &pipeline, const gpu::TextureRef &out, const gpu::TextureRef &a, const gpu::TextureRef &b) {
+                gpu::PassDesc pass;
+                pass.color = out;
+                pass.colorLoad = gpu::Load::DontCare;
+                auto quad = commandBuffer->renderPass(pass);
+                quad->setPipeline(pipeline);
+                quad->setFragmentTexture(a, 0);
+                quad->setFragmentTexture(b, 1);
+                quad->setFragmentSampler(sampler(true, 1, 1), 0);
+                quad->setFragmentBytes(uniforms, sizeof(uniforms));
+                quad->draw(gpu::Primitive::Triangle, 0, 3);
+                quad->end();
+            };
+            run(smaaEdgePipeline, smaaEdges, t.color, useScene ? t.scene : t.color);
+            run(smaaWeightPipeline, smaaWeights, smaaEdges, smaaTables);
+            run(smaaBlendPipeline, smaaOut, t.color, smaaWeights);
+            // PS2X_GS_NATIVE_SMAA_DEBUG=1 shows the edges, =2 the blending weights (diagnostic).
+            static const int debug = [] { const char *v = std::getenv("PS2X_GS_NATIVE_SMAA_DEBUG"); return v ? std::atoi(v) : 0; }();
+            return debug == 1 ? smaaEdges : debug == 2 ? smaaWeights : smaaOut;
+        }
+
+        // Ambient occlusion of a target's last 3D picture, into that copy's alpha (once per frame, before it is shown).
+        void ensureSceneAo(Target &t)
+        {
+            const float strength = optionAo.load(std::memory_order_relaxed);
+            if (strength <= 0.0f || !t.sceneValid || !t.sceneDepthValid || t.sceneHasAo || !aoPipeline || !aoUpsamplePipeline)
+                return;
+            const uint32_t factor = scaleOf(t.fbw), w = (t.scene->width + factor - 1u) / factor, h = (t.scene->height + factor - 1u) / factor;
+            if (!t.ao || t.ao->width != w || t.ao->height != h)
+            {
+                gpu::TextureDesc d;
+                d.width = w;
+                d.height = h;
+                d.usage = gpu::RenderTarget | gpu::ShaderRead;
+                d.storage = gpu::Storage::Private;
+                t.ao = device->newTexture(d);
+            }
+            endPass();
+            ensureCommandBuffer();
+            {
+                gpu::PassDesc pass;
+                pass.color = t.ao;
+                pass.colorLoad = gpu::Load::DontCare;
+                auto quad = commandBuffer->renderPass(pass);
+                // PS2X_GS_NATIVE_AO_RADIUS: the sampling radius in pixels of the game's own resolution (default 10).
+                static const float radius = [] { const char *v = std::getenv("PS2X_GS_NATIVE_AO_RADIUS"); const float r = v ? float(std::atof(v)) : 10.0f; return std::clamp(r, 1.0f, 64.0f); }();
+                const float uniforms[4] = {radius * float(factor), strength, float(factor), 0.0f};
+                quad->setPipeline(aoPipeline);
+                quad->setFragmentTexture(t.sceneDepth, 0);
+                quad->setFragmentBytes(uniforms, sizeof(uniforms));
+                quad->draw(gpu::Primitive::Triangle, 0, 3);
+                quad->end();
+            }
+            {
+                gpu::PassDesc pass;
+                pass.color = t.scene;
+                pass.colorLoad = gpu::Load::Load;
+                auto quad = commandBuffer->renderPass(pass);
+                const float uniforms[4] = {float(factor), 0.0f, 0.0f, 0.0f};
+                quad->setPipeline(aoUpsamplePipeline);
+                quad->setFragmentTexture(t.ao, 0);
+                quad->setFragmentTexture(t.sceneDepth, 1);
+                quad->setFragmentSampler(sampler(false, 1, 1), 0);
+                quad->setFragmentBytes(uniforms, sizeof(uniforms));
+                quad->draw(gpu::Primitive::Triangle, 0, 3);
+                quad->end();
+            }
+            t.sceneHasAo = true;
+        }
+
         void closeBatch()
         {
             if (!batchOpen)
@@ -2296,6 +2632,8 @@ namespace
             const uint32_t zbp = uint32_t(ctx.zbuf) & 0x1FFu;
             const bool zmask = ((ctx.zbuf >> 32) & 1u) != 0u;
             const uint32_t test = uint32_t(ctx.test);
+            if (!splitting && sceneEffectsOn())
+                noteSceneBatch(fbp, fbw, psm, test, zbp);
 
             // A batch that reads the target it draws to. On the GS every primitive sees what the ones before it
             // drew, and Black counts on it: it blurs its glow buffer with twenty sprites in a row, each reading what
@@ -2989,6 +3327,19 @@ namespace
     {
         GS_AUTORELEASE { return window && renderer(handle).attachWindow(window) ? 1 : 0; }
     }
+}
+
+// For the in-game menu (looked up by name, outside the versioned ABI): hide or show the picture over the window,
+// and change display options while the game runs ("fxaa" 0/1, "gamma", "brightness", "sharpen" 0..1).
+extern "C" __attribute__((visibility("default"))) void black_native_gs_set_overlay(void *handle, int menuOpen)
+{
+    if (handle)
+        renderer(handle).setPictureVisible(menuOpen == 0);
+}
+extern "C" __attribute__((visibility("default"))) void black_native_gs_set_option(void *handle, const char *key, float value)
+{
+    if (handle && key)
+        renderer(handle).setOption(key, value);
 }
 
 extern "C" __attribute__((visibility("default"))) const GSParallelAPI *black_parallel_gs_api()

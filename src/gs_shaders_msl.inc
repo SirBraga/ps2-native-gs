@@ -161,7 +161,77 @@ struct PresentUniforms
     float originX, originY, scaleX, scaleY;
     float fxaa; // 1: smooth polygon edges (luminance-contrast edge filter), 0: plain sampling
     float gamma, brightness; // display adjustment: out = (c ^ (1 / gamma)) * brightness
+    float sharpen; // 0..1: contrast-adaptive sharpening (after AMD's CAS), 0 off
+    float useScene; // 1: texture 1 holds the picture of the frame's 3D part, before the game's 2D work (Target::scene)
+    float useAo;    // 1: that picture's alpha holds ambient occlusion (aoFragment), 1 = open, 0 = fully occluded
 };
+
+struct AoUniforms
+{
+    float radius;   // pixels of the (enlarged) Z buffer
+    float strength; // 0..1
+    float factor;   // Z buffer pixels per pixel drawn: the occlusion is worked out at the game's own resolution
+    float pad;
+};
+
+// Ambient occlusion from the Z buffer alone, which works without knowing the game's projection: the GS interpolates Z
+// linearly across the screen, so on any flat surface the mean of two points on opposite sides of a pixel is that
+// pixel's own Z. Where the mean comes out in front (a larger Z: nearer) the surface folds towards the viewer around the
+// pixel, a corner or a crease, and the pixel is occluded in proportion. Pairs that straddle a large jump in depth (an
+// outline against the background) are left out, which is what keeps halos off silhouettes. Differences are relative to
+// the pixel's own Z (with perspective Z ~ 1/w they are relative distances), and never finer than the Z the game's vertices
+// carry (whole units).
+fragment float4 aoFragment(QuadOut in [[stage_in]], depth2d<float> depth [[texture(0)]], constant AoUniforms &u [[buffer(1)]])
+{
+    const int f = int(u.factor);
+    const int2 last = int2(depth.get_width(), depth.get_height()) - 1;
+    const int2 p = min(int2(in.position.xy) * f + f / 2, last);
+    const float zc = depth.read(uint2(p)) * 16777216.0;
+    if (zc < 4.0)
+        return float4(0.0, 0.0, 0.0, 1.0); // nothing drawn (sky, cleared)
+    const float minRel = max(0.002, 1.5 / zc), maxRel = 0.15;
+    const float spin = fract(52.9829189 * fract(0.06711056 * float(p.x) + 0.00583715 * float(p.y))) * 6.2831853;
+    float occlusion = 0.0, weight = 0.0;
+    for (int i = 0; i < 12; ++i)
+    {
+        const float t = (float(i) + 0.5) / 12.0;
+        const float a = spin + float(i) * 2.39996323;
+        const float2 offset = float2(cos(a), sin(a)) * (u.radius * sqrt(t));
+        const float z1 = depth.read(uint2(clamp(p + int2(round(offset)), int2(0), last))) * 16777216.0;
+        const float z2 = depth.read(uint2(clamp(p - int2(round(offset)), int2(0), last))) * 16777216.0;
+        if (abs(z1 - zc) > maxRel * zc || abs(z2 - zc) > maxRel * zc || z1 < 4.0 || z2 < 4.0)
+            continue;
+        const float rel = ((z1 + z2) * 0.5 - zc) / zc;
+        occlusion += smoothstep(minRel, minRel * 6.0, rel) * (1.0 - smoothstep(maxRel * 0.3, maxRel, rel)); // far in front: less
+        weight += 1.0;
+    }
+    const float ao = weight > 0.0 ? 1.0 - u.strength * occlusion / weight : 1.0;
+    return float4(0.0, 0.0, 0.0, saturate(ao));
+}
+
+// The occlusion worked out at the game's resolution, filtered up into the alpha of the full-size scene copy: of the four
+// nearest low-resolution samples, each counts by its bilinear weight and by how close its depth is to this pixel's,
+// so occlusion does not spill across outlines (a joint bilateral upsample).
+fragment float4 aoUpsampleFragment(QuadOut in [[stage_in]], texture2d<float> ao [[texture(0)]], depth2d<float> depth [[texture(1)]], constant float4 &u [[buffer(1)]])
+{
+    const int f = int(u.x);
+    const int2 lastAo = int2(ao.get_width(), ao.get_height()) - 1, lastZ = int2(depth.get_width(), depth.get_height()) - 1;
+    const float z = depth.read(uint2(in.position.xy)) * 16777216.0;
+    const float2 base = in.position.xy / float(f) - 0.5;
+    const int2 i0 = int2(floor(base));
+    const float2 fr = base - float2(i0);
+    float sum = 0.0, weight = 0.0;
+    for (int k = 0; k < 4; ++k)
+    {
+        const int2 i = clamp(i0 + int2(k & 1, k >> 1), int2(0), lastAo);
+        const float zs = depth.read(uint2(min(i * f + f / 2, lastZ))) * 16777216.0;
+        const float bil = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
+        const float w = bil / (1e-3 + abs(zs - z) / max(z, 1.0) * 50.0) + 1e-6;
+        sum += ao.read(uint2(i)).a * w;
+        weight += w;
+    }
+    return float4(0.0, 0.0, 0.0, sum / weight);
+}
 
 float4 presentAdjust(float3 c, constant PresentUniforms &u)
 {
@@ -175,18 +245,64 @@ float presentLuma(float3 c)
 
 // The displayed part of a target, drawn at the window's own pixel size. With fxaa on, an edge (a strong luminance step
 // against the four neighbours) is blended along its direction, which smooths the stair steps of polygon edges.
-fragment float4 presentFragment(QuadOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]], constant PresentUniforms &u [[buffer(1)]])
+//
+// Sharpening: each channel is pushed away from its four neighbours by a weight that shrinks where the neighbourhood
+// already has strong contrast (so edges do not ring and flat noise is not amplified), as AMD's CAS does.
+float3 presentSharpen(float3 c, float3 n, float3 s, float3 w, float3 e, float amount)
+{
+    const float3 mn = min(c, min(min(n, s), min(w, e)));
+    const float3 mx = max(c, max(max(n, s), max(w, e)));
+    const float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));
+    const float3 weight = -amp * mix(0.125, 0.2, amount);
+    return saturate((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight));
+}
+
+// The change an effect makes to the 3D picture, carried over to the shown one where the game's later 2D work kept that
+// picture: film grain changes a pixel a little and darkening overlays and fades scale it (the change is scaled the same
+// way), while the HUD and menus replace it (no change there).
+float3 presentSceneDelta(float3 shown, float3 scene, float3 changed)
+{
+    const float k = clamp(presentLuma(shown) / max(presentLuma(scene), 1.0 / 255.0), 0.0, 1.0);
+    const float3 d = abs(shown - scene * k);
+    return (changed - scene) * k * (1.0 - smoothstep(0.06, 0.16, max(d.r, max(d.g, d.b))));
+}
+
+fragment float4 presentFragment(QuadOut in [[stage_in]], texture2d<float> tex [[texture(0)]], texture2d<float> scene [[texture(1)]], sampler smp [[sampler(0)]], constant PresentUniforms &u [[buffer(1)]])
 {
     const float2 uv = float2(u.originX, u.originY) + in.position.xy * float2(u.scaleX, u.scaleY);
-    const float3 c = tex.sample(smp, uv).rgb;
-    if (u.fxaa == 0.0)
+    float3 c = tex.sample(smp, uv).rgb;
+    if (u.fxaa == 0.0 && u.sharpen == 0.0 && u.useAo == 0.0)
         return presentAdjust(c, u);
     const float2 texel = 1.0 / float2(tex.get_width(), tex.get_height());
-    const float lC = presentLuma(c);
-    const float lN = presentLuma(tex.sample(smp, uv + float2(0.0, -texel.y)).rgb);
-    const float lS = presentLuma(tex.sample(smp, uv + float2(0.0, texel.y)).rgb);
-    const float lW = presentLuma(tex.sample(smp, uv + float2(-texel.x, 0.0)).rgb);
-    const float lE = presentLuma(tex.sample(smp, uv + float2(texel.x, 0.0)).rgb);
+    const float3 cN = tex.sample(smp, uv + float2(0.0, -texel.y)).rgb;
+    const float3 cS = tex.sample(smp, uv + float2(0.0, texel.y)).rgb;
+    const float3 cW = tex.sample(smp, uv + float2(-texel.x, 0.0)).rgb;
+    const float3 cE = tex.sample(smp, uv + float2(texel.x, 0.0)).rgb;
+    const float3 original = c;
+    if (u.useScene != 0.0 && (u.sharpen != 0.0 || u.useAo != 0.0))
+    {
+        const float4 s = scene.sample(smp, uv);
+        const float4 sN = scene.sample(smp, uv + float2(0.0, -texel.y)), sS = scene.sample(smp, uv + float2(0.0, texel.y));
+        const float4 sW = scene.sample(smp, uv + float2(-texel.x, 0.0)), sE = scene.sample(smp, uv + float2(texel.x, 0.0));
+        float3 changed = s.rgb;
+        if (u.sharpen != 0.0)
+            changed = presentSharpen(s.rgb, sN.rgb, sS.rgb, sW.rgb, sE.rgb, u.sharpen);
+        if (u.useAo != 0.0)
+        {
+            // The occlusion is noisy per pixel (a few rotated samples): a small blur, across 2-texel steps.
+            const float2 t2 = texel * 2.0;
+            const float ao = (s.a * 2.0 + scene.sample(smp, uv + float2(t2.x, t2.y)).a + scene.sample(smp, uv + float2(-t2.x, t2.y)).a +
+                              scene.sample(smp, uv + float2(t2.x, -t2.y)).a + scene.sample(smp, uv + float2(-t2.x, -t2.y)).a + sN.a + sS.a + sW.a + sE.a) / 10.0;
+            changed *= ao;
+        }
+        c = saturate(c + presentSceneDelta(c, s.rgb, changed));
+    }
+    else if (u.sharpen != 0.0)
+        c = presentSharpen(c, cN, cS, cW, cE, u.sharpen);
+    if (u.fxaa == 0.0)
+        return presentAdjust(c, u);
+    const float lC = presentLuma(original);
+    const float lN = presentLuma(cN), lS = presentLuma(cS), lW = presentLuma(cW), lE = presentLuma(cE);
     const float lMin = min(lC, min(min(lN, lS), min(lW, lE)));
     const float lMax = max(lC, max(max(lN, lS), max(lW, lE)));
     const float range = lMax - lMin;
@@ -202,6 +318,199 @@ fragment float4 presentFragment(QuadOut in [[stage_in]], texture2d<float> tex [[
     const float strength = saturate(range / max(lMax, 1e-4) * 2.0);
     const float3 smoothed = (a + b) * 0.375 + (across1 + across2) * 0.125;
     return presentAdjust(mix(c, smoothed, strength * 0.75), u);
+}
+
+// ---- SMAA 1x (Jimenez et al., "SMAA: Enhanced Subpixel Morphological Antialiasing", MIT licence; third_party/smaa) ----
+// The three passes of the reference implementation at its ULTRA preset (threshold 0.05, 32 search steps, corner
+// rounding 25), without diagonal detection. Texture coordinates are top-left based as in the reference (DX). The area
+// and search tables share one texture (smaaTables): the area table in rows 0-559, the search table below it, read
+// texel by texel (every lookup lands on texel centres, so this equals the reference's filtered reads).
+// Rounding is to the nearest even integer, as HLSL's round() (the reference's) does: many SMAA values are exact halves.
+constant float SMAA_THRESHOLD = 0.05;
+constant float SMAA_MAX_SEARCH_STEPS = 32.0;
+constant float SMAA_CORNER_ROUNDING_NORM = 0.25;
+constant float SMAA_LOCAL_CONTRAST = 2.0;
+
+struct SmaaUniforms { float4 metrics; float4 flags; }; // metrics: 1/width, 1/height, width, height; flags.x: 1 = texture 1 is the scene copy
+
+float smaaLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// Luma edges at uv (the reference's luma edge detection with local contrast adaptation).
+float2 smaaEdges(texture2d<float> color, sampler smp, float2 uv, float2 px)
+{
+    const float L = smaaLuma(color.sample(smp, uv).rgb);
+    const float Lleft = smaaLuma(color.sample(smp, uv + float2(-px.x, 0.0)).rgb);
+    const float Ltop = smaaLuma(color.sample(smp, uv + float2(0.0, -px.y)).rgb);
+    float4 delta;
+    delta.xy = abs(L - float2(Lleft, Ltop));
+    float2 edges = step(float2(SMAA_THRESHOLD), delta.xy);
+    if (edges.x + edges.y == 0.0)
+        return float2(0.0);
+    const float Lright = smaaLuma(color.sample(smp, uv + float2(px.x, 0.0)).rgb);
+    const float Lbottom = smaaLuma(color.sample(smp, uv + float2(0.0, px.y)).rgb);
+    delta.zw = abs(L - float2(Lright, Lbottom));
+    float2 maxDelta = max(delta.xy, delta.zw);
+    const float Lleftleft = smaaLuma(color.sample(smp, uv + float2(-2.0 * px.x, 0.0)).rgb);
+    const float Ltoptop = smaaLuma(color.sample(smp, uv + float2(0.0, -2.0 * px.y)).rgb);
+    delta.zw = abs(float2(Lleft, Ltop) - float2(Lleftleft, Ltoptop));
+    maxDelta = max(maxDelta.xy, delta.zw);
+    const float finalDelta = max(maxDelta.x, maxDelta.y);
+    return edges * step(finalDelta, SMAA_LOCAL_CONTRAST * delta.xy);
+}
+
+// With the frame's 3D picture at hand an edge must be one in both pictures: film grain makes edges only in the shown
+// one, and an edge of the 3D under the HUD is not one in the shown picture (the HUD is not smoothed along it).
+fragment float4 smaaEdgeFragment(QuadOut in [[stage_in]], texture2d<float> color [[texture(0)]], texture2d<float> scene [[texture(1)]], sampler smp [[sampler(0)]], constant SmaaUniforms &u [[buffer(1)]])
+{
+    const float2 uv = in.position.xy * u.metrics.xy, px = u.metrics.xy;
+    float2 edges = smaaEdges(color, smp, uv, px);
+    if (u.flags.x != 0.0 && edges.x + edges.y != 0.0)
+        edges *= smaaEdges(scene, smp, uv, px);
+    return float4(edges, 0.0, 0.0);
+}
+
+float smaaSearchLength(texture2d<float> tables, float2 e, float offset)
+{
+    // The reference's scale and bias into the 66x33 table, packed as 64x16.
+    const float2 scale = float2(66.0 * 0.5 - 1.0, -33.0 + 1.0), bias = float2(66.0 * offset + 0.5, 33.0 - 0.5);
+    const float2 t = (scale * e + bias); // in texels of the packed table
+    const int2 i = clamp(int2(floor(t)), int2(0), int2(63, 15));
+    return tables.read(uint2(i + int2(0, 560))).r;
+}
+
+float smaaSearchXLeft(texture2d<float> edges, texture2d<float> tables, sampler smp, float2 uv, float end, float2 px)
+{
+    float2 e = float2(0.0, 1.0);
+    while (uv.x > end && e.g > 0.8281 && e.r == 0.0)
+    {
+        e = edges.sample(smp, uv).rg;
+        uv.x -= 2.0 * px.x;
+    }
+    const float offset = -(255.0 / 127.0) * smaaSearchLength(tables, e, 0.0) + 3.25;
+    return px.x * offset + uv.x;
+}
+float smaaSearchXRight(texture2d<float> edges, texture2d<float> tables, sampler smp, float2 uv, float end, float2 px)
+{
+    float2 e = float2(0.0, 1.0);
+    while (uv.x < end && e.g > 0.8281 && e.r == 0.0)
+    {
+        e = edges.sample(smp, uv).rg;
+        uv.x += 2.0 * px.x;
+    }
+    const float offset = -(255.0 / 127.0) * smaaSearchLength(tables, e, 0.5) + 3.25;
+    return -px.x * offset + uv.x;
+}
+float smaaSearchYUp(texture2d<float> edges, texture2d<float> tables, sampler smp, float2 uv, float end, float2 px)
+{
+    float2 e = float2(1.0, 0.0);
+    while (uv.y > end && e.r > 0.8281 && e.g == 0.0)
+    {
+        e = edges.sample(smp, uv).rg;
+        uv.y -= 2.0 * px.y;
+    }
+    const float offset = -(255.0 / 127.0) * smaaSearchLength(tables, e.gr, 0.0) + 3.25;
+    return px.y * offset + uv.y;
+}
+float smaaSearchYDown(texture2d<float> edges, texture2d<float> tables, sampler smp, float2 uv, float end, float2 px)
+{
+    float2 e = float2(1.0, 0.0);
+    while (uv.y < end && e.r > 0.8281 && e.g == 0.0)
+    {
+        e = edges.sample(smp, uv).rg;
+        uv.y += 2.0 * px.y;
+    }
+    const float offset = -(255.0 / 127.0) * smaaSearchLength(tables, e.gr, 0.5) + 3.25;
+    return -px.y * offset + uv.y;
+}
+
+// The area table (160x560, two channels) read with bilinear filtering by hand.
+float2 smaaArea(texture2d<float> tables, float2 dist, float e1, float e2)
+{
+    const float2 t = 16.0 * rint(4.0 * float2(e1, e2)) + dist; // texel coordinates (centres at +0.5)
+    const float2 p = t; // already minus the half texel the reference adds back
+    const int2 i = int2(floor(p));
+    const float2 f = p - float2(i);
+    const int2 hi = int2(159, 559);
+    const float2 a = tables.read(uint2(clamp(i, int2(0), hi))).rg, b = tables.read(uint2(clamp(i + int2(1, 0), int2(0), hi))).rg;
+    const float2 c = tables.read(uint2(clamp(i + int2(0, 1), int2(0), hi))).rg, d = tables.read(uint2(clamp(i + int2(1, 1), int2(0), hi))).rg;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+fragment float4 smaaWeightFragment(QuadOut in [[stage_in]], texture2d<float> edges [[texture(0)]], texture2d<float> tables [[texture(1)]], sampler smp [[sampler(0)]], constant SmaaUniforms &u [[buffer(1)]])
+{
+    const float2 px = u.metrics.xy, uv = in.position.xy * px, pixcoord = in.position.xy;
+    const float4 offset0 = uv.xyxy + px.xyxy * float4(-0.25, -0.125, 1.25, -0.125);
+    const float4 offset1 = uv.xyxy + px.xyxy * float4(-0.125, -0.25, -0.125, 1.25);
+    const float4 offset2 = float4(offset0.xz, offset1.yw) + px.xxyy * float4(-2.0, 2.0, -2.0, 2.0) * SMAA_MAX_SEARCH_STEPS;
+    float4 weights = float4(0.0);
+    const float2 e = edges.sample(smp, uv).rg;
+    if (e.g > 0.0) // an edge at the north
+    {
+        float3 coords;
+        coords.x = smaaSearchXLeft(edges, tables, smp, offset0.xy, offset2.x, px);
+        coords.y = offset1.y;
+        float2 d;
+        d.x = coords.x;
+        const float e1 = edges.sample(smp, coords.xy).r;
+        coords.z = smaaSearchXRight(edges, tables, smp, offset0.zw, offset2.y, px);
+        d.y = coords.z;
+        d = abs(rint(u.metrics.zz * d - pixcoord.xx));
+        const float e2 = edges.sample(smp, coords.zy + float2(px.x, 0.0)).r;
+        weights.rg = smaaArea(tables, sqrt(d), e1, e2);
+        // Corner rounding.
+        coords.y = uv.y;
+        const float2 leftRight = step(d.xy, d.yx);
+        float2 rounding = (1.0 - SMAA_CORNER_ROUNDING_NORM) * leftRight;
+        rounding /= leftRight.x + leftRight.y;
+        float2 factor = float2(1.0);
+        factor.x -= rounding.x * edges.sample(smp, coords.xy + px * float2(0.0, 1.0)).r;
+        factor.x -= rounding.y * edges.sample(smp, coords.zy + px * float2(1.0, 1.0)).r;
+        factor.y -= rounding.x * edges.sample(smp, coords.xy + px * float2(0.0, -2.0)).r;
+        factor.y -= rounding.y * edges.sample(smp, coords.zy + px * float2(1.0, -2.0)).r;
+        weights.rg *= saturate(factor);
+    }
+    if (e.r > 0.0) // an edge at the west
+    {
+        float3 coords;
+        coords.y = smaaSearchYUp(edges, tables, smp, offset1.xy, offset2.z, px);
+        coords.x = offset0.x;
+        float2 d;
+        d.x = coords.y;
+        const float e1 = edges.sample(smp, coords.xy).g;
+        coords.z = smaaSearchYDown(edges, tables, smp, offset1.zw, offset2.w, px);
+        d.y = coords.z;
+        d = abs(rint(u.metrics.ww * d - pixcoord.yy));
+        const float e2 = edges.sample(smp, coords.xz + float2(0.0, px.y)).g;
+        weights.ba = smaaArea(tables, sqrt(d), e1, e2);
+        coords.x = uv.x;
+        const float2 leftRight = step(d.xy, d.yx);
+        float2 rounding = (1.0 - SMAA_CORNER_ROUNDING_NORM) * leftRight;
+        rounding /= leftRight.x + leftRight.y;
+        float2 factor = float2(1.0);
+        factor.x -= rounding.x * edges.sample(smp, coords.xy + px * float2(1.0, 0.0)).g;
+        factor.x -= rounding.y * edges.sample(smp, coords.xz + px * float2(1.0, 1.0)).g;
+        factor.y -= rounding.x * edges.sample(smp, coords.xy + px * float2(-2.0, 0.0)).g;
+        factor.y -= rounding.y * edges.sample(smp, coords.xz + px * float2(-2.0, 1.0)).g;
+        weights.ba *= saturate(factor);
+    }
+    return weights;
+}
+
+fragment float4 smaaBlendFragment(QuadOut in [[stage_in]], texture2d<float> color [[texture(0)]], texture2d<float> blend [[texture(1)]], sampler smp [[sampler(0)]], constant SmaaUniforms &u [[buffer(1)]])
+{
+    const float2 px = u.metrics.xy, uv = in.position.xy * px;
+    float4 a;
+    a.x = blend.sample(smp, uv + float2(px.x, 0.0)).a; // right
+    a.y = blend.sample(smp, uv + float2(0.0, px.y)).g; // bottom
+    a.wz = blend.sample(smp, uv).xz;                   // top, left
+    if (dot(a, float4(1.0)) < 1e-5)
+        return color.sample(smp, uv);
+    const bool h = max(a.x, a.z) > max(a.y, a.w);
+    const float4 blendingOffset = h ? float4(a.x, 0.0, a.z, 0.0) : float4(0.0, a.y, 0.0, a.w);
+    float2 blendingWeight = h ? a.xz : a.yw;
+    blendingWeight /= dot(blendingWeight, float2(1.0));
+    const float4 blendingCoord = blendingOffset * float4(px, -px) + uv.xyxy;
+    return blendingWeight.x * color.sample(smp, blendingCoord.xy) + blendingWeight.y * color.sample(smp, blendingCoord.zw);
 }
 
 struct DepthOut

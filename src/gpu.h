@@ -167,6 +167,8 @@ namespace gpu
         // The window's size in pixels (0 when unknown).
         virtual void pixelSize(uint32_t &width, uint32_t &height) = 0;
         virtual DrawableRef nextDrawable(uint32_t width, uint32_t height) = 0;
+        // Hides the picture (the in-game menu, drawn in the window underneath, shows through) or shows it again.
+        virtual void setVisible(bool visible) = 0;
     };
 
     class Device
