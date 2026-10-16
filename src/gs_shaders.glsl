@@ -47,6 +47,8 @@ layout(set = 0, binding = 1) uniform texture2D tex0;
 layout(set = 0, binding = 2) uniform texture2D tex1;
 layout(set = 0, binding = 3) uniform sampler smp;
 #define TEX sampler2D(tex0, smp)
+// Post-processing reads without derivatives: see sampleL0 in gs_shaders_msl.inc.
+#define textureL0(s, uv) textureLod(s, uv, 0.0)
 #define PALETTE sampler2D(tex1, smp)
 
 #if defined(GS_SPECIALIZED)
@@ -228,7 +230,7 @@ float smaaLuma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 #if defined(STAGE_FS_SMAA_EDGE)
 vec2 smaaEdges(bool scene, vec2 uv, vec2 px)
 {
-#define SMAA_C(o) (scene ? texture(PALETTE, uv + (o)).rgb : texture(TEX, uv + (o)).rgb)
+#define SMAA_C(o) (scene ? textureL0(PALETTE, uv + (o)).rgb : textureL0(TEX, uv + (o)).rgb)
     const float L = smaaLuma(SMAA_C(vec2(0.0)));
     const float Lleft = smaaLuma(SMAA_C(vec2(-px.x, 0.0)));
     const float Ltop = smaaLuma(SMAA_C(vec2(0.0, -px.y)));
@@ -271,7 +273,7 @@ float smaaSearchXLeft(vec2 uv, float end, vec2 px)
     vec2 e = vec2(0.0, 1.0);
     while (uv.x > end && e.g > 0.8281 && e.r == 0.0)
     {
-        e = texture(TEX, uv).rg;
+        e = textureL0(TEX, uv).rg;
         uv.x -= 2.0 * px.x;
     }
     return px.x * (-(255.0 / 127.0) * smaaSearchLength(e, 0.0) + 3.25) + uv.x;
@@ -281,7 +283,7 @@ float smaaSearchXRight(vec2 uv, float end, vec2 px)
     vec2 e = vec2(0.0, 1.0);
     while (uv.x < end && e.g > 0.8281 && e.r == 0.0)
     {
-        e = texture(TEX, uv).rg;
+        e = textureL0(TEX, uv).rg;
         uv.x += 2.0 * px.x;
     }
     return -px.x * (-(255.0 / 127.0) * smaaSearchLength(e, 0.5) + 3.25) + uv.x;
@@ -291,7 +293,7 @@ float smaaSearchYUp(vec2 uv, float end, vec2 px)
     vec2 e = vec2(1.0, 0.0);
     while (uv.y > end && e.r > 0.8281 && e.g == 0.0)
     {
-        e = texture(TEX, uv).rg;
+        e = textureL0(TEX, uv).rg;
         uv.y -= 2.0 * px.y;
     }
     return px.y * (-(255.0 / 127.0) * smaaSearchLength(e.gr, 0.0) + 3.25) + uv.y;
@@ -301,7 +303,7 @@ float smaaSearchYDown(vec2 uv, float end, vec2 px)
     vec2 e = vec2(1.0, 0.0);
     while (uv.y < end && e.r > 0.8281 && e.g == 0.0)
     {
-        e = texture(TEX, uv).rg;
+        e = textureL0(TEX, uv).rg;
         uv.y += 2.0 * px.y;
     }
     return -px.y * (-(255.0 / 127.0) * smaaSearchLength(e.gr, 0.5) + 3.25) + uv.y;
@@ -323,7 +325,7 @@ void main()
     const vec4 offset1 = uv.xyxy + px.xyxy * vec4(-0.125, -0.25, -0.125, 1.25);
     const vec4 offset2 = vec4(offset0.xz, offset1.yw) + px.xxyy * vec4(-2.0, 2.0, -2.0, 2.0) * SMAA_MAX_SEARCH_STEPS;
     vec4 weights = vec4(0.0);
-    const vec2 e = texture(TEX, uv).rg;
+    const vec2 e = textureL0(TEX, uv).rg;
     if (e.g > 0.0)
     {
         vec3 coords;
@@ -331,21 +333,21 @@ void main()
         coords.y = offset1.y;
         vec2 d;
         d.x = coords.x;
-        const float e1 = texture(TEX, coords.xy).r;
+        const float e1 = textureL0(TEX, coords.xy).r;
         coords.z = smaaSearchXRight(offset0.zw, offset2.y, px);
         d.y = coords.z;
         d = abs(roundEven(sm.metrics.zz * d - pixcoord.xx));
-        const float e2 = texture(TEX, coords.zy + vec2(px.x, 0.0)).r;
+        const float e2 = textureL0(TEX, coords.zy + vec2(px.x, 0.0)).r;
         weights.rg = smaaArea(sqrt(d), e1, e2);
         coords.y = uv.y;
         const vec2 leftRight = step(d.xy, d.yx);
         vec2 rounding = (1.0 - SMAA_CORNER_ROUNDING_NORM) * leftRight;
         rounding /= leftRight.x + leftRight.y;
         vec2 factor = vec2(1.0);
-        factor.x -= rounding.x * texture(TEX, coords.xy + px * vec2(0.0, 1.0)).r;
-        factor.x -= rounding.y * texture(TEX, coords.zy + px * vec2(1.0, 1.0)).r;
-        factor.y -= rounding.x * texture(TEX, coords.xy + px * vec2(0.0, -2.0)).r;
-        factor.y -= rounding.y * texture(TEX, coords.zy + px * vec2(1.0, -2.0)).r;
+        factor.x -= rounding.x * textureL0(TEX, coords.xy + px * vec2(0.0, 1.0)).r;
+        factor.x -= rounding.y * textureL0(TEX, coords.zy + px * vec2(1.0, 1.0)).r;
+        factor.y -= rounding.x * textureL0(TEX, coords.xy + px * vec2(0.0, -2.0)).r;
+        factor.y -= rounding.y * textureL0(TEX, coords.zy + px * vec2(1.0, -2.0)).r;
         weights.rg *= clamp(factor, 0.0, 1.0);
     }
     if (e.r > 0.0)
@@ -355,21 +357,21 @@ void main()
         coords.x = offset0.x;
         vec2 d;
         d.x = coords.y;
-        const float e1 = texture(TEX, coords.xy).g;
+        const float e1 = textureL0(TEX, coords.xy).g;
         coords.z = smaaSearchYDown(offset1.zw, offset2.w, px);
         d.y = coords.z;
         d = abs(roundEven(sm.metrics.ww * d - pixcoord.yy));
-        const float e2 = texture(TEX, coords.xz + vec2(0.0, px.y)).g;
+        const float e2 = textureL0(TEX, coords.xz + vec2(0.0, px.y)).g;
         weights.ba = smaaArea(sqrt(d), e1, e2);
         coords.x = uv.x;
         const vec2 leftRight = step(d.xy, d.yx);
         vec2 rounding = (1.0 - SMAA_CORNER_ROUNDING_NORM) * leftRight;
         rounding /= leftRight.x + leftRight.y;
         vec2 factor = vec2(1.0);
-        factor.x -= rounding.x * texture(TEX, coords.xy + px * vec2(1.0, 0.0)).g;
-        factor.x -= rounding.y * texture(TEX, coords.xz + px * vec2(1.0, 1.0)).g;
-        factor.y -= rounding.x * texture(TEX, coords.xy + px * vec2(-2.0, 0.0)).g;
-        factor.y -= rounding.y * texture(TEX, coords.xz + px * vec2(-2.0, 1.0)).g;
+        factor.x -= rounding.x * textureL0(TEX, coords.xy + px * vec2(1.0, 0.0)).g;
+        factor.x -= rounding.y * textureL0(TEX, coords.xz + px * vec2(1.0, 1.0)).g;
+        factor.y -= rounding.x * textureL0(TEX, coords.xy + px * vec2(-2.0, 0.0)).g;
+        factor.y -= rounding.y * textureL0(TEX, coords.xz + px * vec2(-2.0, 1.0)).g;
         weights.ba *= clamp(factor, 0.0, 1.0);
     }
     outColor = weights;
@@ -381,12 +383,12 @@ void main()
 {
     const vec2 px = sm.metrics.xy, uv = gl_FragCoord.xy * px;
     vec4 a;
-    a.x = texture(PALETTE, uv + vec2(px.x, 0.0)).a;
-    a.y = texture(PALETTE, uv + vec2(0.0, px.y)).g;
-    a.wz = texture(PALETTE, uv).xz;
+    a.x = textureL0(PALETTE, uv + vec2(px.x, 0.0)).a;
+    a.y = textureL0(PALETTE, uv + vec2(0.0, px.y)).g;
+    a.wz = textureL0(PALETTE, uv).xz;
     if (dot(a, vec4(1.0)) < 1e-5)
     {
-        outColor = texture(TEX, uv);
+        outColor = textureL0(TEX, uv);
         return;
     }
     const bool h = max(a.x, a.z) > max(a.y, a.w);
@@ -394,7 +396,7 @@ void main()
     vec2 blendingWeight = h ? a.xz : a.yw;
     blendingWeight /= dot(blendingWeight, vec2(1.0));
     const vec4 blendingCoord = blendingOffset * vec4(px, -px) + uv.xyxy;
-    outColor = blendingWeight.x * texture(TEX, blendingCoord.xy) + blendingWeight.y * texture(TEX, blendingCoord.zw);
+    outColor = blendingWeight.x * textureL0(TEX, blendingCoord.xy) + blendingWeight.y * textureL0(TEX, blendingCoord.zw);
 }
 #endif
 
@@ -441,32 +443,32 @@ vec3 presentSharpen(vec3 c, vec3 n, vec3 s, vec3 w, vec3 e, float amount)
 void main()
 {
     const vec2 uv = vec2(pu.originX, pu.originY) + gl_FragCoord.xy * vec2(pu.scaleX, pu.scaleY);
-    vec3 c = texture(TEX, uv).rgb;
+    vec3 c = textureL0(TEX, uv).rgb;
     if (pu.fxaa == 0.0 && pu.sharpen == 0.0 && pu.useAo == 0.0)
     {
         outColor = presentAdjust(c);
         return;
     }
     const vec2 texel = 1.0 / vec2(textureSize(TEX, 0));
-    const vec3 cN = texture(TEX, uv + vec2(0.0, -texel.y)).rgb;
-    const vec3 cS = texture(TEX, uv + vec2(0.0, texel.y)).rgb;
-    const vec3 cW = texture(TEX, uv + vec2(-texel.x, 0.0)).rgb;
-    const vec3 cE = texture(TEX, uv + vec2(texel.x, 0.0)).rgb;
+    const vec3 cN = textureL0(TEX, uv + vec2(0.0, -texel.y)).rgb;
+    const vec3 cS = textureL0(TEX, uv + vec2(0.0, texel.y)).rgb;
+    const vec3 cW = textureL0(TEX, uv + vec2(-texel.x, 0.0)).rgb;
+    const vec3 cE = textureL0(TEX, uv + vec2(texel.x, 0.0)).rgb;
     const vec3 original = c;
     if (pu.useScene != 0.0 && (pu.sharpen != 0.0 || pu.useAo != 0.0))
     {
         // See presentFragment (MSL): the effects' change to the frame's 3D picture (tex1), where the 2D left it alone.
-        const vec4 s = texture(sampler2D(tex1, smp), uv);
-        const vec4 sN = texture(sampler2D(tex1, smp), uv + vec2(0.0, -texel.y)), sS = texture(sampler2D(tex1, smp), uv + vec2(0.0, texel.y));
-        const vec4 sW = texture(sampler2D(tex1, smp), uv + vec2(-texel.x, 0.0)), sE = texture(sampler2D(tex1, smp), uv + vec2(texel.x, 0.0));
+        const vec4 s = textureL0(sampler2D(tex1, smp), uv);
+        const vec4 sN = textureL0(sampler2D(tex1, smp), uv + vec2(0.0, -texel.y)), sS = textureL0(sampler2D(tex1, smp), uv + vec2(0.0, texel.y));
+        const vec4 sW = textureL0(sampler2D(tex1, smp), uv + vec2(-texel.x, 0.0)), sE = textureL0(sampler2D(tex1, smp), uv + vec2(texel.x, 0.0));
         vec3 changed = s.rgb;
         if (pu.sharpen != 0.0)
             changed = presentSharpen(s.rgb, sN.rgb, sS.rgb, sW.rgb, sE.rgb, pu.sharpen);
         if (pu.useAo != 0.0)
         {
             const vec2 t2 = texel * 2.0;
-            const float ao = (s.a * 2.0 + texture(sampler2D(tex1, smp), uv + vec2(t2.x, t2.y)).a + texture(sampler2D(tex1, smp), uv + vec2(-t2.x, t2.y)).a +
-                              texture(sampler2D(tex1, smp), uv + vec2(t2.x, -t2.y)).a + texture(sampler2D(tex1, smp), uv + vec2(-t2.x, -t2.y)).a + sN.a + sS.a + sW.a + sE.a) / 10.0;
+            const float ao = (s.a * 2.0 + textureL0(sampler2D(tex1, smp), uv + vec2(t2.x, t2.y)).a + textureL0(sampler2D(tex1, smp), uv + vec2(-t2.x, t2.y)).a +
+                              textureL0(sampler2D(tex1, smp), uv + vec2(t2.x, -t2.y)).a + textureL0(sampler2D(tex1, smp), uv + vec2(-t2.x, -t2.y)).a + sN.a + sS.a + sW.a + sE.a) / 10.0;
             changed *= ao;
         }
         const float k = clamp(presentLuma(c) / max(presentLuma(s.rgb), 1.0 / 255.0), 0.0, 1.0);
@@ -492,11 +494,11 @@ void main()
     }
     const vec2 gradient = vec2((lW + lE) - 2.0 * lC, (lN + lS) - 2.0 * lC);
     const vec2 along = abs(gradient.x) > abs(gradient.y) ? vec2(0.0, texel.y) : vec2(texel.x, 0.0);
-    const vec3 a = texture(TEX, uv + along * 0.5).rgb;
-    const vec3 b = texture(TEX, uv - along * 0.5).rgb;
+    const vec3 a = textureL0(TEX, uv + along * 0.5).rgb;
+    const vec3 b = textureL0(TEX, uv - along * 0.5).rgb;
     const vec2 across = along.x > 0.0 ? vec2(0.0, texel.y) : vec2(texel.x, 0.0);
-    const vec3 across1 = texture(TEX, uv + across * 0.5).rgb;
-    const vec3 across2 = texture(TEX, uv - across * 0.5).rgb;
+    const vec3 across1 = textureL0(TEX, uv + across * 0.5).rgb;
+    const vec3 across2 = textureL0(TEX, uv - across * 0.5).rgb;
     const float strength = clamp(range / max(lMax, 1e-4) * 2.0, 0.0, 1.0);
     const vec3 smoothed = (a + b) * 0.375 + (across1 + across2) * 0.125;
     outColor = presentAdjust(mix(c, smoothed, strength * 0.75));
